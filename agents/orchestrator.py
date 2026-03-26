@@ -27,14 +27,16 @@ from typing import cast
 
 try:
     from claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, UserMessage,
+        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, RateLimitEvent,
+        ResultMessage, UserMessage,
     )
     from claude_agent_sdk.types import (  # type: ignore[import]
         HookCallback, HookMatcher, TextBlock, ToolResultBlock, ToolUseBlock,
     )
 except ImportError:
     from anthropic.claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, UserMessage,
+        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, RateLimitEvent,
+        ResultMessage, UserMessage,
     )
     from anthropic.claude_agent_sdk.types import (  # type: ignore[import]
         HookCallback, HookMatcher, TextBlock, ToolResultBlock, ToolUseBlock,
@@ -117,6 +119,7 @@ def _build_orchestrator_prompt(event: "IssueEvent", workspace_dir: Path, state: 
                     "description": t.description,
                     "linear_id": t.linear_id,
                     "status": t.status,
+                    "depends_on": t.depends_on,
                 }
                 for t in state.tasks
             ],
@@ -210,6 +213,7 @@ def _apply_state_updates(state: IssueState, updates: dict) -> None:
                 description=t["description"],
                 linear_id=t.get("linear_id"),
                 status=t.get("status", "todo"),
+                depends_on=t.get("depends_on", []),
             )
             for t in updates["tasks"]
         ]
@@ -254,9 +258,12 @@ async def _run_agent_session(
     client: ClaudeSDKClient,
     prompt: str,
     event: "IssueEvent",
-) -> str:
-    """Run one agent session and return the full collected response text."""
+) -> tuple[str, dict | None, float | None, list]:
+    """Run one agent session; returns (response_text, usage, cost_usd, rate_limit_events)."""
     collected: list[str] = []
+    usage: dict | None = None
+    cost_usd: float | None = None
+    rate_limit_events: list = []
     async with client:
         await client.query(prompt)
         async for message in client.receive_response():
@@ -265,7 +272,12 @@ async def _run_agent_session(
                 for block in getattr(message, "content", []):
                     if isinstance(block, TextBlock) and block.text:
                         collected.append(block.text)
-    return "\n".join(collected)
+            elif isinstance(message, ResultMessage):
+                usage = getattr(message, "usage", None)
+                cost_usd = getattr(message, "total_cost_usd", None)
+            elif isinstance(message, RateLimitEvent):
+                rate_limit_events.append(message)
+    return "\n".join(collected), usage, cost_usd, rate_limit_events
 
 
 # --------------------------------------------------------------------------- #
@@ -298,7 +310,21 @@ async def run_issue_workflow(event: "IssueEvent") -> None:
             event.repo_full_name, event.number, state.step,
         )
 
-        response_text = await _run_agent_session(client, prompt, event)
+        response_text, usage, cost_usd, rate_limit_events = await _run_agent_session(client, prompt, event)
+
+        # Record token usage and print summary
+        try:
+            from token_tracker import print_usage_summary, record_usage
+            issue_ref = f"{event.repo_full_name}#{event.number}"
+            record_usage(issue_ref, usage, cost_usd)
+            print_usage_summary(
+                issue_ref=issue_ref,
+                last_usage=usage,
+                last_cost=cost_usd,
+                rate_limit_events=rate_limit_events,
+            )
+        except Exception:
+            logger.warning("Token tracking failed — continuing", exc_info=True)
 
         # Extract and persist state from agent output
         updates = _extract_state_updates(response_text)

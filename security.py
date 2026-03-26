@@ -45,7 +45,7 @@ ALLOWED_BASE_COMMANDS: set[str] = {
 ALLOWED_GIT_SUBCOMMANDS: set[str] = {
     "status", "diff", "log", "add", "commit", "push", "clone",
     "checkout", "branch", "fetch", "stash", "show",
-    "rev-parse", "remote", "config",
+    "rev-parse", "remote", "config", "worktree",
 }
 
 

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     max_concurrent_issues: int = 1
 
 
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

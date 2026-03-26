@@ -35,6 +35,7 @@ class TaskState:
     description: str
     linear_id: str | None = None          # e.g., "MAN-43" — None until sub-issue created
     status: Literal["todo", "in_progress", "done"] = "todo"
+    depends_on: list[int] = field(default_factory=list)  # 0-based indices of tasks this depends on
 
 
 @dataclass

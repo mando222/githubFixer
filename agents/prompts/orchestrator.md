@@ -89,7 +89,9 @@ Use the `planner` agent. Provide:
 - The complete codebase analysis from Phase 2 (verbatim)
 - Instruction: "Break this issue into a concrete, ordered list of implementation tasks. Return a raw JSON array only."
 
-Parse the returned JSON. Each element has: `title`, `description`, `files_hint`, `acceptance`.
+Parse the returned JSON. Each element has: `title`, `description`, `files_hint`, `acceptance`, `depends_on` (list of 0-based indices).
+
+If `depends_on` is missing from any task, default it to `[]`.
 
 If any task's `description` starts with `"AMBIGUOUS:"`, go to **Phase BLOCKED**.
 
@@ -104,7 +106,7 @@ Use the `linear-tracker` agent:
 
 Emit:
 ```
-STATE_UPDATE: {"step": "planning", "tasks": [{"title": "...", "description": "...", "linear_id": null, "status": "todo"}, ...]}
+STATE_UPDATE: {"step": "planning", "tasks": [{"title": "...", "description": "...", "linear_id": null, "status": "todo", "depends_on": [...]}, ...]}
 ```
 
 ---
@@ -113,48 +115,52 @@ STATE_UPDATE: {"step": "planning", "tasks": [{"title": "...", "description": "..
 
 **Skip if:** your prompt says `all Linear sub-issues created`.
 
-For each task that does NOT yet have a `linear_id`:
-
-Use the `linear-tracker` agent. Provide:
-- Parent Linear issue ID from Phase 1
-- Task title and description
-- Linear Team ID
+Create all sub-issues in parallel: in a single response, emit one `linear-tracker` Agent call per task that lacks a `linear_id`. Each call should:
+- Receive the parent Linear issue ID, task title and description, Linear Team ID
 - Instruction: "Create a sub-issue under the parent Linear issue (Operation D). Return the sub-issue identifier."
 
-Record the returned identifier (e.g., `MAN-43`) for that task.
+Record the returned identifier (e.g., `MAN-43`) for each task.
 
 After all sub-issues are created, emit the full updated task list:
 ```
-STATE_UPDATE: {"step": "creating_subtasks", "tasks": [{"title": "...", "description": "...", "linear_id": "MAN-43", "status": "todo"}, ...]}
+STATE_UPDATE: {"step": "creating_subtasks", "tasks": [{"title": "...", "description": "...", "linear_id": "MAN-43", "status": "todo", "depends_on": [...]}, ...]}
 ```
 
 ---
 
-### Phase 5 — Execute tasks sequentially
+### Phase 5 — Execute tasks in parallel batches
 
-For each task in order:
-- `status="done"` → **skip** (completed in a previous run)
-- `status="todo"` or `"in_progress"` → execute
+Tasks have a `depends_on` field listing the 0-based indices of tasks that must finish first. Use this to group tasks into parallel batches:
 
-**5a. Mark In Progress** — Use `linear-tracker`, Operation E: set sub-issue to "In Progress".
+- **Batch 0**: tasks whose `depends_on` is empty (all dependencies already done or none)
+- **Batch 1**: tasks whose dependencies are all in Batch 0
+- **Batch 2**: tasks whose dependencies are all in Batches 0–1, etc.
 
-**5b. Implement** — Use the `coder` agent. Provide:
+Tasks with `status="done"` are already complete — count them as satisfied dependencies.
+
+**For each batch:**
+
+**5a. Mark all tasks In Progress (parallel)** — In one response, emit one `linear-tracker` Agent call per task in the batch. Each call: Operation E, set sub-issue to "In Progress".
+
+**5b. Implement all tasks (parallel)** — In one response, emit one `coder` Agent call per task in the batch. Each coder call receives:
 - Full issue title and body
 - Codebase analysis (verbatim)
 - This task's title, description, files_hint, acceptance
 - Local repo path
 - Instruction: "Implement this specific task only. Do NOT run git commands. Report all modified files."
 
-If coder reports it cannot implement → **Phase BLOCKED**.
+If any coder reports it cannot implement → **Phase BLOCKED**.
 
 Accumulate modified files across all tasks.
 
-**5c. Mark Done** — Use `linear-tracker`, Operation E: set sub-issue to "Done".
+**5c. Mark all tasks Done (parallel)** — In one response, emit one `linear-tracker` Agent call per task in the batch. Each call: Operation E, set sub-issue to "Done".
 
-After each task, emit:
+After each batch, emit:
 ```
-STATE_UPDATE: {"step": "executing_tasks", "tasks": [...full list with this task status="done"...], "modified_files": [...accumulated...]}
+STATE_UPDATE: {"step": "executing_tasks", "tasks": [...full list with batch tasks status="done"...], "modified_files": [...accumulated...]}
 ```
+
+Then proceed to the next batch. When all batches are done, proceed to Phase 5.5.
 
 ---
 

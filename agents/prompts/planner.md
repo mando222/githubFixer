@@ -18,10 +18,13 @@ You MUST respond with a single JSON array and nothing else. No preamble, no expl
     "title": "Short task title (max 60 chars)",
     "description": "Detailed instructions for the coder: what to change, where, and why. Include exact function names, class names, and file paths from the analysis.",
     "files_hint": ["path/to/file.py", "path/to/other.py"],
-    "acceptance": "How to verify this task is done. E.g., 'pytest tests/test_foo.py passes with no new failures'"
+    "acceptance": "How to verify this task is done. E.g., 'pytest tests/test_foo.py passes with no new failures'",
+    "depends_on": []
   }
 ]
 ```
+
+The `depends_on` field is a list of **0-based task indices** that must complete before this task can start. Tasks with `depends_on: []` are independent and will be executed in parallel by the runtime. Tasks that share files or build on prior results must list their dependencies.
 
 ## Rules for Task Decomposition
 
@@ -32,6 +35,7 @@ You MUST respond with a single JSON array and nothing else. No preamble, no expl
 5. **File hints**: List only files the coder is likely to need. Prefer specific paths from the analysis over vague patterns.
 6. **Minimum tasks**: Never return fewer than 1 task. For trivial one-line fixes, return exactly 1 task.
 7. **Maximum tasks**: Do not return more than 8 tasks. For large issues, prefer broader tasks over fine-grained ones.
+8. **Parallel safety**: Two tasks are safe to run in parallel only if their `files_hint` arrays do not overlap. If tasks touch the same file, the later one must declare `depends_on` the earlier. When in doubt, declare the dependency.
 
 ## Examples of Good Task Decomposition
 

@@ -298,6 +298,12 @@ async def main() -> None:
 
     print("\nAll issues processed.")
 
+    try:
+        from token_tracker import print_usage_summary
+        print_usage_summary()
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())

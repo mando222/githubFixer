@@ -46,6 +46,17 @@ _BASH_HOOKS = {
     ]
 }
 
+# Serialize Linear project creation per repo so parallel plan() calls for issues
+# in the same repo don't each create a duplicate project (race condition).
+# Mirrors the _base_clone_locks pattern in workspace.py.
+_linear_project_locks: dict[str, asyncio.Lock] = {}
+
+
+def _linear_project_lock(repo_full_name: str) -> asyncio.Lock:
+    if repo_full_name not in _linear_project_locks:
+        _linear_project_locks[repo_full_name] = asyncio.Lock()
+    return _linear_project_locks[repo_full_name]
+
 
 # --------------------------------------------------------------------------- #
 # Data models                                                                  #
@@ -457,12 +468,16 @@ class IssueWorkflow:
         need_linear = not state.found
         if need_linear:
             logger.info("[%s] Phase 1+2: Creating Linear issue + analyzing codebase in parallel", self._label)
-            linear_result, self.analysis = await asyncio.gather(
-                self._run_linear_tracker(self._prompt_create_linear_issue()),
-                self._run_codebase_analyzer(self._prompt_analyze_codebase()),
+            # Codebase analysis runs freely; project creation is serialized per repo
+            # to prevent concurrent plan() calls from creating duplicate Linear projects.
+            analysis_task = asyncio.create_task(
+                self._run_codebase_analyzer(self._prompt_analyze_codebase())
             )
-            self.linear_issue_id = _extract_linear_id(linear_result)
-            self.linear_project_id = _extract_uuid(linear_result)
+            async with _linear_project_lock(self.event.repo_full_name):
+                linear_result = await self._run_linear_tracker(self._prompt_create_linear_issue())
+                self.linear_issue_id = _extract_linear_id(linear_result)
+                self.linear_project_id = _extract_uuid(linear_result)
+            self.analysis = await analysis_task
             logger.info("[%s] Linear issue: %s", self._label, self.linear_issue_id)
         else:
             logger.info("[%s] Phase 2: Analyzing codebase", self._label)
@@ -681,13 +696,15 @@ class IssueWorkflow:
 
     async def _phase_test_and_remediate(self, cycle: int = 0) -> bool:
         """Run tests via the tester agent and remediate failures. Returns True if tests pass."""
-        if cycle >= 2:
+        if cycle >= settings.max_remediation_cycles:
             if self.linear_issue_id:
                 await self._run_linear_tracker(
                     f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
-                    f"Comment: ⚠️ Tests still failing after 2 remediation cycles."
+                    f"Comment: ⚠️ Tests still failing after {settings.max_remediation_cycles} remediation cycles."
                 )
-            await self._phase_blocked("Tests still failing after 2 remediation cycles")
+            await self._phase_blocked(
+                f"Tests still failing after {settings.max_remediation_cycles} remediation cycles"
+            )
             return False
 
         logger.info("[%s] Phase 5.5: Running tests (cycle %d)", self._label, cycle)

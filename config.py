@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     # How long (seconds) to allow planning phases (0.5-4) before timing out
     planning_timeout_seconds: int = 600  # 10 minutes
 
-    # Max fix-and-re-review cycles before blocking (mirrors test remediation cycles)
+    # Max code→test→fix cycles before blocking (high to allow full self-correction)
+    max_remediation_cycles: int = 12
+    # Max review-fix-re-review cycles before blocking
     max_review_cycles: int = 2
 
 

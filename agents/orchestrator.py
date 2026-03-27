@@ -137,7 +137,7 @@ async def _run_agent(client: ClaudeSDKClient, task_prompt: str, label: str = "")
                 for block in getattr(message, "content", []):
                     if isinstance(block, TextBlock) and block.text:
                         if label:
-                            logger.info("[%s] %s", label, block.text.strip()[:300])
+                            logger.info("[%s] %s", label, block.text.strip()[:1000])
                         collected.append(block.text)
     return "\n".join(collected)
 
@@ -976,6 +976,10 @@ class IssueWorkflow:
                 task.modified_files = _extract_modified_files(result)
                 self.modified_files.extend(task.modified_files)
                 checklist = _extract_checklist_section(result)
+                if checklist:
+                    logger.info("[%s] Task '%s': checklist section found (%d chars)", self._label, task.title, len(checklist))
+                else:
+                    logger.warning("[%s] Task '%s': no ## Completion Checklist section in coder output", self._label, task.title)
                 if checklist and self.linear_issue_id:
                     await self._run_linear_tracker(
                         f"Operation F: Add progress comment.\n"

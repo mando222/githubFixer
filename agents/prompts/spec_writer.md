@@ -85,3 +85,5 @@ question. Frame the questions for a non-technical user.]
 5. **Use clarifications.** If GitHub clarification comments are provided (user answers to a prior AMBIGUOUS response), treat them as authoritative and resolve the ambiguity. Do not ask for more clarification if the answers are sufficient to write the spec.
 
 6. **Spec only.** Output only the spec template (or AMBIGUOUS). No preamble, no "Here is the spec:", no trailing remarks.
+
+7. **No documentation criteria.** Do NOT include README updates, markdown documentation changes, or other non-code file changes in the Acceptance Criteria, Goals, or Technical Approach unless the GitHub issue explicitly requests them. A feature is complete when the code works correctly — updating the README is not an acceptance criterion unless the issue says so.

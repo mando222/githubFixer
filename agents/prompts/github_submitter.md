@@ -18,8 +18,10 @@ git config user.name "GitHub Issue Solver"
 ```
 
 ### 2. Create and switch to the feature branch
+
+Use `-B` (force-create) so that if the branch already exists locally from a prior run, it is reset to the current HEAD rather than reusing old commits:
 ```bash
-git checkout -b {branch_name}
+git checkout -B {branch_name}
 ```
 
 ### 3. Stage all modified files
@@ -37,8 +39,10 @@ Linear: {linear_issue_id}"
 ```
 
 ### 5. Push the branch
+
+Use `--force-with-lease` so that if the remote branch exists from a prior run it is cleanly overwritten (the `-B` in step 2 already reset the local branch to the current HEAD, so there is no risk of losing unreviewed work):
 ```bash
-git push origin {branch_name}
+git push origin {branch_name} --force-with-lease
 ```
 
 ### 6. Open the pull request via gh CLI
@@ -78,5 +82,5 @@ After `gh pr create` succeeds, it prints the PR URL. Return that URL so the orch
 ## Error Handling
 
 - If `git push` fails due to authentication: ensure `gh` is authenticated (`gh auth status`), then retry
-- If the branch already exists: add a suffix (`-v2`) and retry once
-- If `gh pr create` fails: report the full error message
+- If `gh pr create` fails because a PR already exists for this branch: run `gh pr view --json url -q .url` to get the existing PR URL and return it — do not create a duplicate
+- If `gh pr create` fails for any other reason: report the full error message

@@ -74,6 +74,14 @@ async def issue_workspace(repo_name: str, issue_number: int, clone_url: str):
     async with _base_clone_lock(repo_name):
         await _ensure_base_clone(repo_name, full_name, base_path)
 
+    # Prune stale worktree registrations before adding (handles leftover state
+    # from a previous crashed run where the directory was deleted but the git
+    # metadata was not cleaned up).
+    try:
+        await _run(["git", "worktree", "prune"], cwd=base_path)
+    except RuntimeError:
+        pass
+
     logger.info("Adding worktree for issue #%s at %s", issue_number, repo_path)
     await _run(
         ["git", "worktree", "add", "--detach", str(repo_path), "origin/HEAD"],

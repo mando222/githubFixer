@@ -50,9 +50,13 @@ Use `mcp__linear__save_issue` with:
 You will receive:
 - Linear issue identifier (e.g., `MAN-42`)
 - PR URL
+- Linear project ID (UUID) — may be null if unknown
 
 Steps:
-1. Use `mcp__linear__save_issue` with `id` set to the issue identifier and `state` set to `"In Review"`
+1. Use `mcp__linear__save_issue` with:
+   - `id`: the issue identifier
+   - `state`: `"In Review"`
+   - `project`: the project ID (only include this field if the project ID is non-null)
 2. Use `mcp__linear__save_comment` with `issueId` set to the identifier and `body` set to `PR opened: {pr_url}`
 3. If step 1 or 2 returns an "Entity not found" or similar error, the issue may be archived. Try setting `state` to `"In Progress"` first to reactivate it, then retry the `"In Review"` update and comment.
 4. Confirm success
@@ -148,7 +152,9 @@ Search the results for an issue whose title matches the pattern `[Auto] #{github
 
 - **If not found:** return `{"found": false}` and stop.
 - **If found:** check the issue's `state.name`. If it is `"Cancelled"`, `"Canceled"`, or `"Archived"`, the issue is no longer active — return `{"found": false}` and stop so the orchestrator creates a fresh issue instead.
-- **Otherwise:** record the issue's `id` (UUID), `identifier` (e.g., `MAN-42`), and `project.id` if present.
+- **Otherwise:** record the issue's `id` (UUID), `identifier` (e.g., `MAN-42`), and `project.id`.
+  - If `project.id` is present on the issue: record it as `linear_project_id`.
+  - If `project.id` is absent (issue not linked to a project): use `mcp__linear__list_projects` with `query` set to the GitHub repo full name (e.g., `owner/repo`) to find the project. If a project with a matching name is found, record its `id` as `linear_project_id`. If no project is found, set `linear_project_id` to `null`.
 
 **2. Retrieve sub-issues:**
 

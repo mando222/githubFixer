@@ -215,7 +215,8 @@ Use the `linear-tracker` agent. Provide:
 - Parent Linear issue ID
 - PR URL
 - Linear Team ID
-- Instruction: "Update the Linear parent issue: set status to 'In Review' and add a comment with the PR URL (Operation B)."
+- Linear Project ID (from Phase 0.5 or Phase 1 — pass even if null)
+- Instruction: "Update the Linear parent issue: set status to 'In Review', re-assert project membership using the provided project ID, and add a comment with the PR URL (Operation B)."
 
 ---
 

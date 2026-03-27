@@ -3,9 +3,9 @@
 GitHub Issue Solver — CLI entry point
 ======================================
 
-Fetches open issues from a GitHub repo via Arcade (same OAuth used by the
-agents), lets you approve which ones to solve, then runs the full agent
-pipeline (analyze → code → PR → Linear tracking).
+Fetches open issues from a GitHub repo via the gh CLI, lets you approve
+which ones to solve, then runs the full agent pipeline
+(analyze → code → PR → Linear tracking).
 
 Usage
 -----
@@ -63,23 +63,9 @@ def _gh(args: list[str]) -> list | dict:
     return json.loads(result.stdout)
 
 
-def fetch_open_prs(owner: str, repo: str) -> set[str]:
-    """Return set of branch name prefixes for open PRs (e.g. 'fix/issue-5-')."""
-    try:
-        prs: list[dict] = _gh([
-            "pr", "list",
-            "--repo", f"{owner}/{repo}",
-            "--state", "open",
-            "--json", "headRefName",
-            "--limit", "100",
-        ])
-        return {pr["headRefName"] for pr in prs}
-    except Exception:
-        return set()
-
 
 def fetch_open_issues(owner: str, repo: str, *, unassigned_only: bool = False) -> list[dict]:
-    """Return open issues (PRs excluded) via gh CLI, skipping issues with an existing open PR."""
+    """Return open issues (PRs excluded) via gh CLI."""
     raw: list[dict] = _gh([
         "issue", "list",
         "--repo", f"{owner}/{repo}",
@@ -88,19 +74,9 @@ def fetch_open_issues(owner: str, repo: str, *, unassigned_only: bool = False) -
         "--limit", "100",
     ])
 
-    open_pr_branches = fetch_open_prs(owner, repo)
-
     issues = []
     for item in raw:
         if unassigned_only and item.get("assignees"):
-            continue
-        # Skip issues that already have an open PR (branch prefix match)
-        issue_prefix = f"fix/issue-{item['number']}-"
-        if any(branch.startswith(issue_prefix) for branch in open_pr_branches):
-            logger.info(
-                "Skipping issue #%d (%s) — open PR already exists",
-                item["number"], item["title"],
-            )
             continue
         # gh issue list excludes PRs by default
         issues.append(item)

@@ -70,7 +70,7 @@ def make_linear_tracker() -> AgentDefinition:
         description=(
             "Linear project management agent. Operations: "
             "A=create parent issue, B=mark In Review with PR URL, C=mark Needs Clarification, "
-            "D=create sub-issue under parent, E=update sub-issue status (In Progress/Done). "
+            "D=create sub-issue under parent, G=query existing issue state for resume. "
             "Returns Linear issue IDs or confirmation."
         ),
         prompt=load_prompt("linear_tracker"),

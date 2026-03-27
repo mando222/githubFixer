@@ -24,8 +24,14 @@ Use the `linear-tracker` agent. Provide:
 - Linear Team ID
 - Instruction: "Check if a Linear parent issue already exists for GitHub issue #{number} (Operation G). Return the full reconstruction JSON."
 
+**If `{"found": true, "blocked": true, ...}`:**
+- The issue was previously blocked in Linear (Cancelled state). Skip all phases and stop immediately — do not create a duplicate issue.
+
 **If `{"found": true, "in_review": true, ...}`:**
-- The issue already has a PR in review. Skip all phases and stop immediately — no further work needed for this run.
+- If `pr_url` is null → treat as `{"found": false}` and proceed to Phase 1 normally (something went wrong with prior tracking).
+- If `pr_url` is set → verify the PR is still open: run `gh pr view {pr_url} --json state --jq '.state'`
+  - If `"OPEN"` → skip all phases and stop — PR is active, no further work needed.
+  - If `"CLOSED"`, `"MERGED"`, or the command errors → treat as `{"found": false}` and proceed to Phase 1 normally.
 
 **If `{"found": true, ...}`:**
 - Use the returned `linear_issue_id`, `linear_project_id`, `tasks`, and `pr_url` for all subsequent phases
@@ -71,12 +77,9 @@ Use the `codebase-analyzer` agent. Provide:
 - Local repo path
 - Instruction: "Analyze the codebase and return a structured report identifying the relevant files, root cause, and proposed implementation approach."
 
-After both results are back, post a progress comment:
+After both results are back, post a progress comment directly:
 
-Use the `linear-tracker` agent:
-- Linear issue ID (from Phase 1 result or Phase 0.5)
-- Comment: "🔍 **Codebase analyzed.** Planning implementation tasks..."
-- Instruction: "Add this progress comment (Operation F)."
+Call `mcp__linear__save_comment` with `issueId` = the Linear issue ID and `body` = `"🔍 **Codebase analyzed.** Planning implementation tasks..."`
 
 Keep the analysis text in your context — you will pass it verbatim to the planner and coder agents.
 
@@ -99,12 +102,9 @@ If any task's `description` starts with `"AMBIGUOUS:"`, go to **Phase BLOCKED**.
 
 If output is not valid JSON, wrap it as a single task with title "Implement issue fix".
 
-Then post a progress comment:
+Then post a progress comment directly:
 
-Use the `linear-tracker` agent:
-- Linear issue ID
-- Comment: "📋 **Plan ready — {N} tasks:**\n{numbered list of task titles}"
-- Instruction: "Add this progress comment (Operation F)."
+Call `mcp__linear__save_comment` with `issueId` = the Linear issue ID and `body` = `"📋 **Plan ready — {N} tasks:**\n{numbered list of task titles}"`
 
 Keep the full task list in your context for Phase 4.
 
@@ -135,7 +135,7 @@ Tasks have a `depends_on` field listing the 0-based indices of tasks that must f
 
 Tasks with `status: "done"` are already complete — skip them, count them as satisfied dependencies.
 
-**5a. Mark ALL incomplete tasks In Progress (once, before any batches)** — **PARALLEL STEP**: In a single response, emit one `linear-tracker` tool_use block per task that is NOT `status: "done"` (no text between blocks). Each call: Operation E, set sub-issue to "In Progress". Wait for all results.
+**5a. Mark ALL incomplete tasks In Progress (once, before any batches)** — **PARALLEL STEP**: In a single response, emit one `mcp__linear__save_issue` call per task that is NOT `status: "done"` (no text between blocks). Each call: `id` = sub-issue identifier, `state` = `"In Progress"`. Wait for all results.
 
 **For each batch:**
 
@@ -152,7 +152,7 @@ Accumulate modified files across all tasks.
 
 Then proceed to the next batch.
 
-**5c. Mark ALL tasks Done (once, after all batches complete)** — **PARALLEL STEP**: In a single response, emit one `linear-tracker` tool_use block per task that was executed (no text between blocks). Each call: Operation E, set sub-issue to "Done". Wait for all results.
+**5c. Mark ALL tasks Done (once, after all batches complete)** — **PARALLEL STEP**: In a single response, emit one `mcp__linear__save_issue` call per task that was executed (no text between blocks). Each call: `id` = sub-issue identifier, `state` = `"Done"`. Wait for all results.
 
 Then proceed to Phase 5.5.
 
@@ -172,17 +172,13 @@ Use the `coder` agent. Provide:
 
 **5.5b. If all tests pass:**
 
-Post a progress comment:
-Use `linear-tracker`, Operation F: comment on the parent issue:
-`"✅ **All tests passing.** Proceeding to open PR."`
+Call `mcp__linear__save_comment` directly: `issueId` = parent Linear issue ID, `body` = `"✅ **All tests passing.** Proceeding to open PR."`
 
 Proceed to Phase 6.
 
 **5.5c. If tests fail and fewer than 2 remediation cycles have been run:**
 
-Post a progress comment:
-Use `linear-tracker`, Operation F: comment on the parent issue:
-`"🔧 **Test failures found (cycle {n}/2).** Creating fix tasks for {N} failure(s):\n{list of failing test names}"`
+Call `mcp__linear__save_comment` directly: `issueId` = parent Linear issue ID, `body` = `"🔧 **Test failures found (cycle {n}/2).** Creating fix tasks for {N} failure(s):\n{list of failing test names}"`
 
 For each distinct failure, create a new task:
 - title: `"Fix: {test name} failure"`
@@ -196,8 +192,7 @@ Then loop back to **5.5a** to re-run the test suite.
 
 **5.5d. If tests still fail after 2 cycles:**
 
-Post a progress comment:
-Use `linear-tracker`, Operation F: `"⚠️ **Tests still failing after 2 remediation cycles.** Sending to Phase BLOCKED."`
+Call `mcp__linear__save_comment` directly: `issueId` = parent Linear issue ID, `body` = `"⚠️ **Tests still failing after 2 remediation cycles.** Sending to Phase BLOCKED."`
 
 Go to **Phase BLOCKED** with the test failure details as the reason.
 

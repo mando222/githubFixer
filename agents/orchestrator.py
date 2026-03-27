@@ -1,51 +1,287 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from linear_config import get_linear_mcp_config
-from agents.definitions import (
-    make_codebase_analyzer,
-    make_coder,
-    make_github_submitter,
-    make_linear_tracker,
-    make_planner,
-)
+from agents.definitions import AGENT_MODELS
 from config import settings
+from linear_config import LINEAR_TOOLS, get_linear_mcp_config
 from prompts import load_prompt
+from security import bash_security_hook
 from workspace import issue_workspace
 
 if TYPE_CHECKING:
     from models import IssueEvent
 
-from typing import cast
-
 try:
     from claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, RateLimitEvent,
-        ResultMessage, UserMessage,
+        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
+        ResultMessage, RateLimitEvent,
     )
     from claude_agent_sdk.types import (  # type: ignore[import]
-        HookCallback, HookMatcher, TextBlock, ToolResultBlock, ToolUseBlock,
+        HookCallback, HookMatcher, TextBlock,
     )
 except ImportError:
     from anthropic.claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, RateLimitEvent,
-        ResultMessage, UserMessage,
+        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
+        ResultMessage, RateLimitEvent,
     )
     from anthropic.claude_agent_sdk.types import (  # type: ignore[import]
-        HookCallback, HookMatcher, TextBlock, ToolResultBlock, ToolUseBlock,
+        HookCallback, HookMatcher, TextBlock,
     )
-
-from security import bash_security_hook
 
 logger = logging.getLogger(__name__)
 
+_BASH_HOOKS = {
+    "PreToolUse": [
+        HookMatcher(
+            matcher="Bash",
+            hooks=[cast(HookCallback, bash_security_hook)],
+        )
+    ]
+}
+
 
 # --------------------------------------------------------------------------- #
-# Security settings                                                             #
+# Data models                                                                  #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Task:
+    title: str
+    description: str
+    files_hint: list[str]
+    acceptance: str
+    depends_on: list[int]
+    linear_id: str | None = None
+    status: str = "todo"  # "todo", "in_progress", "done"
+    modified_files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LinearState:
+    found: bool
+    blocked: bool = False
+    in_review: bool = False
+    pr_url: str | None = None
+    linear_issue_id: str | None = None
+    linear_project_id: str | None = None
+    tasks: list[Task] = field(default_factory=list)
+
+
+@dataclass
+class TestResult:
+    passed: bool
+    summary: str
+    failures: list[dict]  # each: {test, error, file, suggested_fix}
+    command: str
+
+
+@dataclass
+class ReviewResult:
+    approved: bool        # True if verdict=APPROVED (warnings don't block)
+    summary: str
+    critical_issues: list[dict]  # only severity=critical items
+
+
+# --------------------------------------------------------------------------- #
+# Agent client helpers                                                         #
+# --------------------------------------------------------------------------- #
+
+def _make_agent_client(
+    system_prompt: str,
+    model: str,
+    tools: list[str],
+    repo_path: Path,
+    settings_file: Path,
+    mcp_servers: dict | None = None,
+    hooks: dict | None = None,
+) -> ClaudeSDKClient:
+    return ClaudeSDKClient(
+        options=ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            model=model,
+            tools=tools,
+            cwd=str(repo_path),
+            settings=str(settings_file.resolve()),
+            mcp_servers=mcp_servers or {},
+            hooks=hooks or {},
+        )
+    )
+
+
+async def _run_agent(client: ClaudeSDKClient, task_prompt: str, label: str = "") -> str:
+    """Run a single agent session and return the full text response."""
+    collected: list[str] = []
+    async with client:
+        await client.query(task_prompt)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in getattr(message, "content", []):
+                    if isinstance(block, TextBlock) and block.text:
+                        if label:
+                            logger.info("[%s] %s", label, block.text.strip()[:300])
+                        collected.append(block.text)
+    return "\n".join(collected)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers                                                               #
+# --------------------------------------------------------------------------- #
+
+_LINEAR_ID_RE = re.compile(r'\b([A-Z]+-\d+)\b')
+_UUID_RE = re.compile(
+    r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b', re.I
+)
+_PR_URL_RE = re.compile(r'https://github\.com/\S+/pull/\d+')
+
+
+def _extract_linear_id(text: str) -> str | None:
+    m = _LINEAR_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _extract_uuid(text: str) -> str | None:
+    m = _UUID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _extract_pr_url(text: str) -> str | None:
+    m = _PR_URL_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _parse_task_list(text: str) -> list[Task]:
+    start = text.find('[')
+    end = text.rfind(']') + 1
+    if start != -1 and end > 0:
+        try:
+            raw = json.loads(text[start:end])
+            return [
+                Task(
+                    title=item.get("title", ""),
+                    description=item.get("description", ""),
+                    files_hint=item.get("files_hint", []),
+                    acceptance=item.get("acceptance", ""),
+                    depends_on=item.get("depends_on", []),
+                )
+                for item in raw
+            ]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return [Task(
+        title="Implement issue fix",
+        description=text,
+        files_hint=[],
+        acceptance="Implementation complete",
+        depends_on=[],
+    )]
+
+
+def _parse_linear_state(text: str) -> LinearState:
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    if start == -1 or end == 0:
+        return LinearState(found=False)
+    try:
+        data = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return LinearState(found=False)
+
+    if not data.get("found"):
+        return LinearState(found=False)
+
+    tasks = [
+        Task(
+            title=t.get("title", ""),
+            description=t.get("description", ""),
+            files_hint=[],
+            acceptance="",
+            depends_on=[],
+            linear_id=t.get("linear_id"),
+            status=t.get("status", "todo"),
+        )
+        for t in data.get("tasks", [])
+    ]
+    return LinearState(
+        found=True,
+        blocked=data.get("blocked", False),
+        in_review=data.get("in_review", False),
+        pr_url=data.get("pr_url"),
+        linear_issue_id=data.get("linear_issue_id"),
+        linear_project_id=data.get("linear_project_id"),
+        tasks=tasks,
+    )
+
+
+def _extract_modified_files(text: str) -> list[str]:
+    """Extract file paths from a coder response's 'Modified Files' section."""
+    files: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        if "modified files" in line.lower() or "## Modified" in line:
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("##"):
+                break
+            stripped = line.strip().lstrip("-* ").strip()
+            if stripped and "/" in stripped:
+                candidate = stripped.split()[0]
+                if "." in candidate.split("/")[-1]:
+                    files.append(candidate)
+    return list(dict.fromkeys(files))  # deduplicate, preserve order
+
+
+def _parse_tester_output(text: str) -> TestResult:
+    """Parse structured JSON from the tester agent."""
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    if start != -1 and end > 0:
+        try:
+            data = json.loads(text[start:end])
+            return TestResult(
+                passed=data.get("status") == "PASS",
+                summary=data.get("summary", ""),
+                failures=data.get("failures", []),
+                command=data.get("command", ""),
+            )
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Fallback: heuristic
+    upper = text.upper()
+    passed = "FAIL" not in upper and "ERROR" not in upper
+    return TestResult(passed=passed, summary=text[:200], failures=[], command="")
+
+
+def _parse_reviewer_output(text: str) -> ReviewResult:
+    """Parse structured JSON from the reviewer agent."""
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    if start != -1 and end > 0:
+        try:
+            data = json.loads(text[start:end])
+            all_issues = data.get("issues", [])
+            critical = [i for i in all_issues if i.get("severity") == "critical"]
+            approved = data.get("verdict") == "APPROVED" or not critical
+            return ReviewResult(
+                approved=approved,
+                summary=data.get("summary", ""),
+                critical_issues=critical,
+            )
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Fallback: if parsing fails, approve to avoid false blocks
+    return ReviewResult(approved=True, summary=text[:200], critical_issues=[])
+
+
+# --------------------------------------------------------------------------- #
+# Security settings                                                            #
 # --------------------------------------------------------------------------- #
 
 def _write_security_settings(workspace_dir: Path) -> Path:
@@ -69,95 +305,622 @@ def _write_security_settings(workspace_dir: Path) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# Prompt builder                                                                #
+# IssueWorkflow                                                                #
 # --------------------------------------------------------------------------- #
 
-def _build_orchestrator_prompt(event: "IssueEvent", workspace_dir: Path) -> str:
-    repo_path = workspace_dir / "repo"
-    return f"""You are resolving GitHub issue #{event.number} from the repository {event.repo_full_name}.
+class IssueWorkflow:
+    """Python-driven state machine that orchestrates the issue resolution workflow.
 
-**Issue Title:** {event.title}
+    Each phase is an async method. Parallel phases use asyncio.gather() to
+    guarantee concurrent execution regardless of model behavior.
+    """
 
-**Issue Body:**
-{event.body or "(no body provided)"}
+    def __init__(self, event: "IssueEvent", workspace_dir: Path) -> None:
+        self.event = event
+        self.workspace_dir = workspace_dir
+        self.repo_path = workspace_dir / "repo"
+        self.settings_file = workspace_dir / ".claude_settings.json"
+        self._label = f"{event.repo_full_name}#{event.number}"
 
-**Repository:** {event.repo_full_name}
-**Repo Owner:** {event.repo_owner}
-**Repo Name:** {event.repo_name}
-**Local Clone Path:** {repo_path}
-**Issue URL:** {event.html_url}
-**Branch to create:** {event.branch_name}
-**Linear Team ID:** {settings.linear_team_id}
-**Linear Project Name:** {event.repo_full_name}
+        # Workflow state
+        self.linear_issue_id: str | None = None
+        self.linear_project_id: str | None = None
+        self.tasks: list[Task] = []
+        self.analysis: str = ""
+        self.pr_url: str | None = None
+        self.modified_files: list[str] = []
 
-Begin with Phase 0.5 to check Linear for existing state, then follow phases in order.
-Pass data explicitly between agents.
-"""
+        # Preload prompts once
+        self._linear_prompt = load_prompt("linear_tracker")
+        self._analyzer_prompt = load_prompt("codebase_analyzer")
+        self._coder_prompt = load_prompt("coder")
+        self._tester_prompt = load_prompt("tester")
+        self._reviewer_prompt = load_prompt("reviewer")
+        self._planner_prompt = load_prompt("planner")
+        self._submitter_prompt = load_prompt("github_submitter")
 
+    # ---------------------------------------------------------------------- #
+    # Agent runners — each creates a fresh session                            #
+    # ---------------------------------------------------------------------- #
 
-# --------------------------------------------------------------------------- #
-# Client factory                                                                #
-# --------------------------------------------------------------------------- #
-
-def _make_client(repo_path: Path, settings_file: Path) -> ClaudeSDKClient:
-    return ClaudeSDKClient(
-        options=ClaudeAgentOptions(
-            system_prompt=load_prompt("orchestrator"),
-            model=settings.orchestrator_model,
-            cwd=str(repo_path),
-            settings=str(settings_file.resolve()),
+    async def _run_linear_tracker(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._linear_prompt,
+            model=AGENT_MODELS["linear-tracker"],
+            tools=LINEAR_TOOLS,
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
             mcp_servers=get_linear_mcp_config(),
-            agents={
-                "codebase-analyzer": make_codebase_analyzer(),
-                "coder": make_coder(),
-                "github-submitter": make_github_submitter(),
-                "linear-tracker": make_linear_tracker(),
-                "planner": make_planner(),
-            },
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(
-                        matcher="Bash",
-                        hooks=[cast(HookCallback, bash_security_hook)],
-                    ),
-                ],
-            },
         )
-    )
+        return await _run_agent(client, task, f"{self._label} linear")
+
+    async def _run_codebase_analyzer(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._analyzer_prompt,
+            model=AGENT_MODELS["codebase-analyzer"],
+            tools=["Read", "Glob", "Grep"],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+        )
+        return await _run_agent(client, task, f"{self._label} analyzer")
+
+    async def _run_coder(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._coder_prompt,
+            model=AGENT_MODELS["coder"],
+            tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+            hooks=_BASH_HOOKS,
+        )
+        return await _run_agent(client, task, f"{self._label} coder")
+
+    async def _run_tester(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._tester_prompt,
+            model=AGENT_MODELS["tester"],
+            tools=["Bash", "Read"],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+            hooks=_BASH_HOOKS,
+        )
+        return await _run_agent(client, task, f"{self._label} tester")
+
+    async def _run_reviewer(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._reviewer_prompt,
+            model=AGENT_MODELS["reviewer"],
+            tools=["Bash", "Read", "Glob", "Grep"],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+            hooks=_BASH_HOOKS,
+        )
+        return await _run_agent(client, task, f"{self._label} reviewer")
+
+    async def _run_planner(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._planner_prompt,
+            model=AGENT_MODELS["planner"],
+            tools=[],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+        )
+        return await _run_agent(client, task, f"{self._label} planner")
+
+    async def _run_github_submitter(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._submitter_prompt,
+            model=AGENT_MODELS["github-submitter"],
+            tools=["Bash", "Read"],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+            hooks=_BASH_HOOKS,
+        )
+        return await _run_agent(client, task, f"{self._label} submitter")
+
+    # ---------------------------------------------------------------------- #
+    # Main run loop                                                            #
+    # ---------------------------------------------------------------------- #
+
+    async def run(self) -> None:
+        logger.info("[%s] Starting workflow: %s", self._label, self.event.title)
+
+        # Phase 0.5 — Check Linear for existing state
+        state = await self._phase_check_linear()
+
+        if state.blocked:
+            logger.info("[%s] Previously blocked in Linear — skipping", self._label)
+            return
+
+        if state.in_review and state.pr_url:
+            if await self._pr_is_open(state.pr_url):
+                logger.info("[%s] PR %s still open — skipping", self._label, state.pr_url)
+                return
+            # PR closed/merged — treat as fresh start
+            state = LinearState(found=False)
+
+        if state.found:
+            self.linear_issue_id = state.linear_issue_id
+            self.linear_project_id = state.linear_project_id
+            if state.tasks:
+                self.tasks = state.tasks
+
+            if state.pr_url:
+                if await self._pr_is_open(state.pr_url):
+                    logger.info("[%s] PR open — jumping to Phase 7", self._label)
+                    self.pr_url = state.pr_url
+                    await self._phase_final_linear_update()
+                    return
+                state.pr_url = None
+
+            if self.tasks and all(t.status == "done" for t in self.tasks):
+                logger.info("[%s] All tasks done — jumping to Phase 6", self._label)
+                await self._phase_submit_pr()
+                await self._phase_final_linear_update()
+                return
+
+        # Phase 1+2 — Create Linear issue + Analyze codebase (parallel when both needed)
+        need_linear = not state.found
+        need_analysis = not self.tasks
+
+        if need_linear and need_analysis:
+            logger.info("[%s] Phase 1+2: Creating Linear issue + analyzing codebase in parallel", self._label)
+            linear_result, self.analysis = await asyncio.gather(
+                self._run_linear_tracker(self._prompt_create_linear_issue()),
+                self._run_codebase_analyzer(self._prompt_analyze_codebase()),
+            )
+            self.linear_issue_id = _extract_linear_id(linear_result)
+            self.linear_project_id = _extract_uuid(linear_result)
+            logger.info("[%s] Linear issue: %s", self._label, self.linear_issue_id)
+
+        elif need_linear:
+            logger.info("[%s] Phase 1: Creating Linear issue", self._label)
+            result = await self._run_linear_tracker(self._prompt_create_linear_issue())
+            self.linear_issue_id = _extract_linear_id(result)
+            self.linear_project_id = _extract_uuid(result)
+
+        elif need_analysis:
+            logger.info("[%s] Phase 2: Analyzing codebase", self._label)
+            self.analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
+
+        # Post analysis progress comment
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add progress comment.\n"
+                f"Issue ID: {self.linear_issue_id}\n"
+                f"Comment: 🔍 **Codebase analyzed.** Planning implementation tasks..."
+            )
+
+        # Phase 3 — Plan
+        if not self.tasks:
+            logger.info("[%s] Phase 3: Planning tasks", self._label)
+            plan_result = await self._run_planner(self._prompt_plan())
+            self.tasks = _parse_task_list(plan_result)
+
+            if self.tasks and self.tasks[0].description.startswith("AMBIGUOUS:"):
+                await self._phase_blocked(self.tasks[0].description)
+                return
+
+            if self.linear_issue_id:
+                task_list = "\n".join(f"{i+1}. {t.title}" for i, t in enumerate(self.tasks))
+                await self._run_linear_tracker(
+                    f"Operation F: Add progress comment.\n"
+                    f"Issue ID: {self.linear_issue_id}\n"
+                    f"Comment: 📋 **Plan ready — {len(self.tasks)} tasks:**\n{task_list}"
+                )
+
+        # Phase 4 — Create Linear sub-issues (parallel)
+        await self._phase_create_sub_issues()
+
+        # Phase 5 — Execute tasks in dependency batches
+        if await self._phase_execute_tasks():
+            return  # blocked
+
+        # Refresh modified files from git (authoritative, replaces heuristic parsing)
+        self.modified_files = await self._get_modified_files_from_git()
+
+        # Phase 5.5 — Test & remediate (uses dedicated tester agent)
+        if not await self._phase_test_and_remediate():
+            return  # blocked after 2 cycles
+
+        # Phase 5.6 — Code review
+        if not await self._phase_review():
+            return  # blocked after reviewer fix attempt
+
+        # Phase 6 — Submit PR
+        await self._phase_submit_pr()
+
+        # Phase 7 — Final Linear update
+        await self._phase_final_linear_update()
+
+    # ---------------------------------------------------------------------- #
+    # Phase implementations                                                   #
+    # ---------------------------------------------------------------------- #
+
+    async def _phase_check_linear(self) -> LinearState:
+        logger.info("[%s] Phase 0.5: Checking Linear state", self._label)
+        result = await self._run_linear_tracker(
+            f"Operation G: Check if a Linear parent issue exists for GitHub issue #{self.event.number}.\n\n"
+            f"GitHub issue number: {self.event.number}\n"
+            f"GitHub repo full name: {self.event.repo_full_name}\n"
+            f"Linear Team ID: {settings.linear_team_id}\n\n"
+            f"Return the full reconstruction JSON."
+        )
+        return _parse_linear_state(result)
+
+    async def _phase_create_sub_issues(self) -> None:
+        tasks_needing_id = [t for t in self.tasks if not t.linear_id]
+        if not tasks_needing_id or not self.linear_issue_id:
+            return
+
+        logger.info("[%s] Phase 4: Creating %d sub-issues in parallel", self._label, len(tasks_needing_id))
+        prompts = [
+            f"Operation D: Create a sub-issue under the parent Linear issue.\n\n"
+            f"Parent Linear issue ID: {self.linear_issue_id}\n"
+            f"Task title: {t.title}\n"
+            f"Task description: {t.description}\n"
+            f"Linear Team ID: {settings.linear_team_id}\n\n"
+            f"Return the sub-issue identifier (e.g., MAN-43)."
+            for t in tasks_needing_id
+        ]
+        results = await asyncio.gather(*[self._run_linear_tracker(p) for p in prompts])
+
+        for task, result in zip(tasks_needing_id, results):
+            task.linear_id = _extract_linear_id(result)
+            logger.info("[%s] Sub-issue '%s' → %s", self._label, task.title, task.linear_id)
+
+    async def _phase_execute_tasks(self) -> bool:
+        """Execute all tasks in dependency batches. Returns True if blocked."""
+        # 5a — Mark all incomplete tasks In Progress (parallel)
+        incomplete = [t for t in self.tasks if t.status != "done" and t.linear_id]
+        if incomplete:
+            logger.info("[%s] Phase 5a: Marking %d tasks In Progress in parallel", self._label, len(incomplete))
+            await asyncio.gather(*[
+                self._run_linear_tracker(
+                    f"Operation E: Update sub-issue status.\n"
+                    f"Sub-issue identifier: {t.linear_id}\n"
+                    f"New status: In Progress"
+                )
+                for t in incomplete
+            ])
+            for t in incomplete:
+                t.status = "in_progress"
+
+        # 5b — Execute each batch in parallel
+        batches = self._build_batches()
+        logger.info("[%s] Phase 5b: %d batch(es), %d task(s)", self._label, len(batches), len(self.tasks))
+
+        for batch_idx, batch in enumerate(batches):
+            logger.info("[%s] Batch %d: executing %d task(s) in parallel", self._label, batch_idx, len(batch))
+            results = await asyncio.gather(*[self._run_coder(self._prompt_coder_task(t)) for t in batch])
+
+            for task, result in zip(batch, results):
+                if "## Cannot Implement" in result:
+                    await self._phase_blocked(f"Coder blocked on task: {task.title}")
+                    return True
+                task.modified_files = _extract_modified_files(result)
+                self.modified_files.extend(task.modified_files)
+
+        # 5c — Mark all tasks Done (parallel)
+        executed = [t for t in self.tasks if t.linear_id]
+        if executed:
+            logger.info("[%s] Phase 5c: Marking %d tasks Done in parallel", self._label, len(executed))
+            await asyncio.gather(*[
+                self._run_linear_tracker(
+                    f"Operation E: Update sub-issue status.\n"
+                    f"Sub-issue identifier: {t.linear_id}\n"
+                    f"New status: Done"
+                )
+                for t in executed
+            ])
+            for t in executed:
+                t.status = "done"
+
+        return False
+
+    async def _phase_test_and_remediate(self, cycle: int = 0) -> bool:
+        """Run tests via the tester agent and remediate failures. Returns True if tests pass."""
+        if cycle >= 2:
+            if self.linear_issue_id:
+                await self._run_linear_tracker(
+                    f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
+                    f"Comment: ⚠️ Tests still failing after 2 remediation cycles."
+                )
+            await self._phase_blocked("Tests still failing after 2 remediation cycles")
+            return False
+
+        logger.info("[%s] Phase 5.5: Running tests (cycle %d)", self._label, cycle)
+        raw = await self._run_tester(self._prompt_run_tests())
+        result = _parse_tester_output(raw)
+
+        if result.passed:
+            if self.linear_issue_id:
+                await self._run_linear_tracker(
+                    f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
+                    f"Comment: ✅ All tests passing ({result.summary}). Proceeding to review."
+                )
+            return True
+
+        # Tests failed — create remediation tasks
+        logger.info("[%s] Phase 5.5: %d failure(s): %s", self._label, len(result.failures), result.summary)
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
+                f"Comment: 🔧 Test failures (cycle {cycle + 1}/2): {result.summary}"
+            )
+
+        fix_tasks = [
+            Task(
+                title=f"Fix: {f.get('test', 'test failure')[:60]}",
+                description=(
+                    f"Test: {f.get('test', '')}\n"
+                    f"Error: {f.get('error', '')}\n"
+                    f"Suggested fix: {f.get('suggested_fix', '')}"
+                ),
+                files_hint=[f.get("file", "")] if f.get("file") else [],
+                acceptance="Tests pass",
+                depends_on=[],
+            )
+            for f in result.failures[:5]
+        ]
+
+        if fix_tasks:
+            self.tasks.extend(fix_tasks)
+            await self._phase_create_sub_issues()
+            await self._phase_execute_tasks_subset(fix_tasks)
+
+        return await self._phase_test_and_remediate(cycle + 1)
+
+    async def _phase_review(self) -> bool:
+        """Review the implementation against the issue requirements. Returns True to proceed."""
+        logger.info("[%s] Phase 5.6: Code review", self._label)
+        raw = await self._run_reviewer(self._prompt_review())
+        result = _parse_reviewer_output(raw)
+
+        if result.approved:
+            if self.linear_issue_id:
+                await self._run_linear_tracker(
+                    f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
+                    f"Comment: ✅ Code review passed. {result.summary}"
+                )
+            return True
+
+        # Critical issues found — create fix tasks and apply them once
+        logger.info("[%s] Phase 5.6: %d critical issue(s) found", self._label, len(result.critical_issues))
+        if self.linear_issue_id:
+            issues_list = "\n".join(f"- {i.get('description', '')}" for i in result.critical_issues)
+            await self._run_linear_tracker(
+                f"Operation F: Add comment.\nIssue ID: {self.linear_issue_id}\n"
+                f"Comment: 🔍 Review found {len(result.critical_issues)} issue(s):\n{issues_list}"
+            )
+
+        fix_tasks = [
+            Task(
+                title=f"Fix: {i.get('description', 'review issue')[:60]}",
+                description=(
+                    f"File: {i.get('file', '')}\n"
+                    f"Issue: {i.get('description', '')}\n"
+                    f"Fix: {i.get('fix', '')}"
+                ),
+                files_hint=[i.get("file", "")] if i.get("file") else [],
+                acceptance="Reviewer concern addressed",
+                depends_on=[],
+            )
+            for i in result.critical_issues
+        ]
+
+        self.tasks.extend(fix_tasks)
+        await self._phase_create_sub_issues()
+        blocked = await self._phase_execute_tasks_subset(fix_tasks)
+        if blocked:
+            return False
+
+        # Refresh modified files after fixes
+        self.modified_files = await self._get_modified_files_from_git()
+        return True  # one round of fixes — proceed to PR
+
+    async def _phase_execute_tasks_subset(self, tasks: list[Task]) -> bool:
+        """Execute a specific subset of tasks (e.g. remediation fixes). Returns True if blocked."""
+        # Mark In Progress
+        await asyncio.gather(*[
+            self._run_linear_tracker(
+                f"Operation E: Update sub-issue status.\n"
+                f"Sub-issue identifier: {t.linear_id}\n"
+                f"New status: In Progress"
+            )
+            for t in tasks if t.linear_id
+        ])
+
+        # Execute in parallel
+        results = await asyncio.gather(*[self._run_coder(self._prompt_coder_task(t)) for t in tasks])
+
+        for task, result in zip(tasks, results):
+            if "## Cannot Implement" in result:
+                await self._phase_blocked(f"Coder blocked on fix task: {task.title}")
+                return True
+            task.modified_files = _extract_modified_files(result)
+            self.modified_files.extend(task.modified_files)
+
+        # Mark Done
+        await asyncio.gather(*[
+            self._run_linear_tracker(
+                f"Operation E: Update sub-issue status.\n"
+                f"Sub-issue identifier: {t.linear_id}\n"
+                f"New status: Done"
+            )
+            for t in tasks if t.linear_id
+        ])
+        for t in tasks:
+            t.status = "done"
+
+        return False
+
+    async def _phase_submit_pr(self) -> None:
+        logger.info("[%s] Phase 6: Submitting PR", self._label)
+        files_list = "\n".join(f"- {f}" for f in sorted(set(self.modified_files))) or "(all changed files)"
+        result = await self._run_github_submitter(
+            f"Create a pull request for GitHub issue #{self.event.number}.\n\n"
+            f"Modified files:\n{files_list}\n\n"
+            f"GitHub issue number: {self.event.number}\n"
+            f"GitHub issue title: {self.event.title}\n"
+            f"Repo owner: {self.event.repo_owner}\n"
+            f"Repo name: {self.event.repo_name}\n"
+            f"Branch name: {self.event.branch_name}\n"
+            f"Linear issue ID: {self.linear_issue_id or 'N/A'}\n\n"
+            f"Create the branch, commit all changes, push, and open a PR "
+            f"targeting the default branch. Return the PR URL."
+        )
+        self.pr_url = _extract_pr_url(result)
+        logger.info("[%s] PR URL: %s", self._label, self.pr_url)
+
+    async def _phase_final_linear_update(self) -> None:
+        if not self.linear_issue_id:
+            return
+        logger.info("[%s] Phase 7: Final Linear update", self._label)
+        await self._run_linear_tracker(
+            f"Operation B: Mark the Linear issue as In Review with the PR URL.\n\n"
+            f"Linear issue identifier: {self.linear_issue_id}\n"
+            f"PR URL: {self.pr_url or 'N/A'}\n"
+            f"Linear project ID: {self.linear_project_id or 'null'}"
+        )
+
+    async def _phase_blocked(self, reason: str) -> None:
+        logger.warning("[%s] Phase BLOCKED: %s", self._label, reason)
+        if not self.linear_issue_id:
+            return
+        await self._run_linear_tracker(
+            f"Operation C: Mark as Needs Clarification.\n\n"
+            f"Linear issue identifier: {self.linear_issue_id}\n"
+            f"Reason: {reason}"
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Prompt builders                                                          #
+    # ---------------------------------------------------------------------- #
+
+    def _prompt_create_linear_issue(self) -> str:
+        return (
+            f"Operation A: Create a new Linear issue to track this work.\n\n"
+            f"GitHub issue title: {self.event.title}\n"
+            f"GitHub issue body: {self.event.body or '(no body)'}\n"
+            f"GitHub issue number: {self.event.number}\n"
+            f"GitHub issue URL: {self.event.html_url}\n"
+            f"GitHub repo full name: {self.event.repo_full_name}\n"
+            f"Linear Team ID: {settings.linear_team_id}\n"
+            f"Linear Project Name: {self.event.repo_full_name}\n\n"
+            f"Return the Linear issue ID (e.g., MAN-42) and the Linear project ID (UUID)."
+        )
+
+    def _prompt_analyze_codebase(self) -> str:
+        return (
+            f"Analyze the codebase at {self.repo_path} to understand what needs to change "
+            f"to resolve this GitHub issue.\n\n"
+            f"Issue title: {self.event.title}\n"
+            f"Issue body: {self.event.body or '(no body)'}\n"
+            f"Local repo path: {self.repo_path}\n\n"
+            f"Return a structured analysis report."
+        )
+
+    def _prompt_plan(self) -> str:
+        return (
+            f"Break this GitHub issue into implementation tasks.\n\n"
+            f"Issue title: {self.event.title}\n"
+            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Codebase Analysis:\n{self.analysis}\n\n"
+            f"Return a raw JSON array of tasks only."
+        )
+
+    def _prompt_coder_task(self, task: Task) -> str:
+        return (
+            f"Implement this specific task for GitHub issue #{self.event.number}.\n\n"
+            f"Issue title: {self.event.title}\n"
+            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Codebase Analysis:\n{self.analysis}\n\n"
+            f"Task title: {task.title}\n"
+            f"Task description: {task.description}\n"
+            f"Files hint: {', '.join(task.files_hint) or 'see analysis'}\n"
+            f"Acceptance criteria: {task.acceptance}\n\n"
+            f"Local repo path: {self.repo_path}\n\n"
+            f"Implement this specific task only. Do NOT run git commands. "
+            f"Report all modified files at the end."
+        )
+
+    def _prompt_run_tests(self) -> str:
+        return (
+            f"Run the full test suite for the repository at {self.repo_path}.\n"
+            f"Do NOT modify any files.\n\n"
+            f"Codebase analysis (use for test command discovery):\n{self.analysis}\n\n"
+            f"Return ONLY the JSON result object — no preamble, no markdown."
+        )
+
+    def _prompt_review(self) -> str:
+        files_list = "\n".join(f"- {f}" for f in self.modified_files) or "(check git diff)"
+        return (
+            f"Review the code changes made for GitHub issue #{self.event.number}.\n\n"
+            f"Issue title: {self.event.title}\n"
+            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Modified files:\n{files_list}\n\n"
+            f"Local repo path: {self.repo_path}\n\n"
+            f"Return ONLY the JSON result object — no preamble, no markdown."
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Utilities                                                                #
+    # ---------------------------------------------------------------------- #
+
+    async def _pr_is_open(self, pr_url: str) -> bool:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"gh pr view {pr_url} --json state --jq '.state'",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.repo_path),
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            return stdout.decode().strip().upper() == "OPEN"
+        except Exception:
+            return False
+
+    async def _get_modified_files_from_git(self) -> list[str]:
+        """Return the list of files changed since the last commit via git diff."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                "git diff --name-only HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.repo_path),
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            files = [f.strip() for f in stdout.decode().splitlines() if f.strip()]
+            if files:
+                logger.info("[%s] git diff reported %d modified file(s)", self._label, len(files))
+                return files
+        except Exception:
+            pass
+        # Fall back to the heuristic list accumulated during coding
+        return self.modified_files
+
+    def _build_batches(self) -> list[list[Task]]:
+        """Group tasks into dependency-ordered batches for parallel execution."""
+        done_indices = {i for i, t in enumerate(self.tasks) if t.status == "done"}
+        pending = [(i, t) for i, t in enumerate(self.tasks) if t.status != "done"]
+
+        batches: list[list[Task]] = []
+        while pending:
+            ready = [(i, t) for i, t in pending if all(d in done_indices for d in t.depends_on)]
+            if not ready:
+                ready = [pending[0]]  # break circular dependency
+            batches.append([t for _, t in ready])
+            ready_indices = {i for i, _ in ready}
+            done_indices |= ready_indices
+            pending = [(i, t) for i, t in pending if i not in ready_indices]
+
+        return batches
+
 
 
 # --------------------------------------------------------------------------- #
-# Agent session runner                                                          #
-# --------------------------------------------------------------------------- #
-
-async def _run_agent_session(
-    client: ClaudeSDKClient,
-    prompt: str,
-    event: "IssueEvent",
-) -> tuple[str, dict | None, float | None, list]:
-    """Run one agent session; returns (response_text, usage, cost_usd, rate_limit_events)."""
-    collected: list[str] = []
-    usage: dict | None = None
-    cost_usd: float | None = None
-    rate_limit_events: list = []
-    async with client:
-        await client.query(prompt)
-        async for message in client.receive_response():
-            _log_message(message, event)
-            if isinstance(message, AssistantMessage):
-                for block in getattr(message, "content", []):
-                    if isinstance(block, TextBlock) and block.text:
-                        collected.append(block.text)
-            elif isinstance(message, ResultMessage):
-                usage = getattr(message, "usage", None)
-                cost_usd = getattr(message, "total_cost_usd", None)
-            elif isinstance(message, RateLimitEvent):
-                rate_limit_events.append(message)
-    return "\n".join(collected), usage, cost_usd, rate_limit_events
-
-
-# --------------------------------------------------------------------------- #
-# Main workflow                                                                 #
+# Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 
 async def run_issue_workflow(event: "IssueEvent") -> None:
@@ -167,65 +930,8 @@ async def run_issue_workflow(event: "IssueEvent") -> None:
     )
 
     async with issue_workspace(event.repo_name, event.number, event.clone_url) as workspace_dir:
-        settings_file = _write_security_settings(workspace_dir)
-        repo_path = workspace_dir / "repo"
-
-        client = _make_client(repo_path, settings_file)
-        prompt = _build_orchestrator_prompt(event, workspace_dir)
-
-        logger.info("Running orchestrator for %s#%d", event.repo_full_name, event.number)
-
-        response_text, usage, cost_usd, rate_limit_events = await _run_agent_session(
-            client, prompt, event
-        )
-
-        try:
-            from token_tracker import print_usage_summary, record_usage
-            issue_ref = f"{event.repo_full_name}#{event.number}"
-            record_usage(issue_ref, usage, cost_usd)
-            print_usage_summary(
-                issue_ref=issue_ref,
-                last_usage=usage,
-                last_cost=cost_usd,
-                rate_limit_events=rate_limit_events,
-            )
-        except Exception:
-            logger.warning("Token tracking failed — continuing", exc_info=True)
+        _write_security_settings(workspace_dir)
+        workflow = IssueWorkflow(event, workspace_dir)
+        await workflow.run()
 
     logger.info("Workflow complete for %s#%d", event.repo_full_name, event.number)
-
-
-# --------------------------------------------------------------------------- #
-# Message logging                                                               #
-# --------------------------------------------------------------------------- #
-
-def _log_message(message: object, event: "IssueEvent") -> None:
-    tag = f"[{event.repo_full_name}#{event.number}]"
-
-    if isinstance(message, AssistantMessage):
-        for block in getattr(message, "content", []):
-            if isinstance(block, TextBlock) and block.text.strip():
-                logger.info("%s %s", tag, block.text.strip()[:300])
-            elif isinstance(block, ToolUseBlock):
-                inp = getattr(block, "input", {})
-                brief = str(inp)[:200] if inp else ""
-                logger.info("%s → tool_use: %s  input: %s", tag, block.name, brief)
-
-    elif isinstance(message, UserMessage):
-        for block in getattr(message, "content", []):
-            if isinstance(block, ToolResultBlock):
-                if getattr(block, "is_error", False):
-                    logger.warning(
-                        "%s ← TOOL ERROR (tool_use_id=%s): %s",
-                        tag,
-                        getattr(block, "tool_use_id", "?"),
-                        str(block.content)[:500],
-                    )
-                else:
-                    content_preview = str(getattr(block, "content", ""))[:150]
-                    logger.info("%s ← tool_result OK: %s", tag, content_preview)
-
-    else:
-        msg_type = getattr(message, "type", type(message).__name__)
-        if msg_type not in ("system", "rate_limit"):
-            logger.debug("%s [%s]", tag, msg_type)

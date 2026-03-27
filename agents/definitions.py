@@ -14,6 +14,17 @@ except ImportError:
 
 ModelShortname = Literal["sonnet", "opus", "haiku", "inherit"]
 
+# Full model IDs for direct (non-subagent) invocation
+AGENT_MODELS: dict[str, str] = {
+    "codebase-analyzer": settings.analyzer_agent_model,
+    "coder": settings.coding_agent_model,
+    "tester": settings.tester_agent_model,
+    "reviewer": settings.reviewer_agent_model,
+    "github-submitter": settings.github_agent_model,
+    "linear-tracker": settings.linear_agent_model,
+    "planner": settings.planner_agent_model,
+}
+
 
 def _shortname(model: str) -> ModelShortname:
     """Map a full Claude model string to the AgentDefinition shortname literal."""
@@ -76,6 +87,31 @@ def make_linear_tracker() -> AgentDefinition:
         prompt=load_prompt("linear_tracker"),
         tools=LINEAR_TOOLS,
         model=_shortname(settings.linear_agent_model),
+    )
+
+
+def make_tester() -> AgentDefinition:
+    return AgentDefinition(
+        description=(
+            "Test runner. Use AFTER coding to run the full test suite and return structured "
+            "JSON results. Does NOT modify files. Returns pass/fail status and failure details."
+        ),
+        prompt=load_prompt("tester"),
+        tools=["Bash", "Read"],
+        model=_shortname(settings.tester_agent_model),
+    )
+
+
+def make_reviewer() -> AgentDefinition:
+    return AgentDefinition(
+        description=(
+            "Code reviewer. Use AFTER tests pass to verify the implementation addresses the "
+            "issue. Reads git diff, checks correctness and completeness. Returns structured "
+            "JSON with verdict (APPROVED/NEEDS_CHANGES) and issues list."
+        ),
+        prompt=load_prompt("reviewer"),
+        tools=["Bash", "Read", "Glob", "Grep"],
+        model=_shortname(settings.reviewer_agent_model),
     )
 
 

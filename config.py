@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     # Models (optional — defaults shown)
     orchestrator_model: str = "claude-sonnet-4-6"
     coding_agent_model: str = "claude-sonnet-4-6"
+    tester_agent_model: str = "claude-sonnet-4-6"
+    reviewer_agent_model: str = "claude-sonnet-4-6"
     github_agent_model: str = "claude-haiku-4-5-20251001"
     linear_agent_model: str = "claude-haiku-4-5-20251001"
     analyzer_agent_model: str = "claude-haiku-4-5-20251001"

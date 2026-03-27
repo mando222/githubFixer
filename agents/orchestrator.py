@@ -141,6 +141,20 @@ async def _run_agent(client: ClaudeSDKClient, task_prompt: str, label: str = "")
     return "\n".join(collected)
 
 
+async def _gh_subprocess(args: list[str], cwd: Path, timeout: float = 30.0) -> str:
+    """Run a gh CLI command and return stdout. Raises RuntimeError on non-zero exit."""
+    proc = await asyncio.create_subprocess_exec(
+        "gh", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd),
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args)} failed: {stderr.decode().strip()}")
+    return stdout.decode()
+
+
 # --------------------------------------------------------------------------- #
 # Parsing helpers                                                               #
 # --------------------------------------------------------------------------- #
@@ -338,6 +352,7 @@ class IssueWorkflow:
         self.linear_project_id: str | None = None
         self.tasks: list[Task] = []
         self.analysis: str = ""
+        self.spec: str = ""
         self.pr_url: str | None = None
         self.modified_files: list[str] = []
 
@@ -349,6 +364,8 @@ class IssueWorkflow:
         self._reviewer_prompt = load_prompt("reviewer")
         self._planner_prompt = load_prompt("planner")
         self._submitter_prompt = load_prompt("github_submitter")
+        self._spec_writer_prompt = load_prompt("spec_writer")
+        self._spec_reviewer_prompt = load_prompt("spec_reviewer")
 
     # ---------------------------------------------------------------------- #
     # Agent runners — each creates a fresh session                            #
@@ -418,6 +435,26 @@ class IssueWorkflow:
         )
         return await _run_agent(client, task, f"{self._label} planner")
 
+    async def _run_spec_writer(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._spec_writer_prompt,
+            model=AGENT_MODELS["spec-writer"],
+            tools=[],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+        )
+        return await _run_agent(client, task, f"{self._label} spec-writer")
+
+    async def _run_spec_reviewer(self, task: str) -> str:
+        client = _make_agent_client(
+            system_prompt=self._spec_reviewer_prompt,
+            model=AGENT_MODELS["spec-reviewer"],
+            tools=[],
+            repo_path=self.repo_path,
+            settings_file=self.settings_file,
+        )
+        return await _run_agent(client, task, f"{self._label} spec-reviewer")
+
     async def _run_github_submitter(self, task: str) -> str:
         client = _make_agent_client(
             system_prompt=self._submitter_prompt,
@@ -434,18 +471,41 @@ class IssueWorkflow:
     # ---------------------------------------------------------------------- #
 
     async def plan(self) -> None:
-        """Run planning phases (0.5-4): Linear issue + analysis + task planning + sub-issues.
+        """Run planning phases (0.5-4): Linear issue + analysis + spec + review + tasks + sub-issues.
 
         Designed to run without a concurrency semaphore so all incoming issues are
         planned immediately and show up in Linear while execution is throttled.
         """
         logger.info("[%s] Starting planning: %s", self._label, self.event.title)
 
-        # Phase 0.5 — Check if already planned
+        # Phase 0.5 — Check if already planned / recover state
         state = await self._phase_check_linear()
 
+        # Handle previously blocked issues: check if user replied on GitHub
         if state.blocked:
-            logger.info("[%s] Previously blocked — skipping planning", self._label)
+            user_replies = await self._check_for_unblock()
+            if user_replies is None:
+                logger.info("[%s] Previously blocked — no user reply yet, skipping", self._label)
+                return
+            # User replied — reactivate Linear issue, re-analyze, re-spec, re-plan
+            logger.info("[%s] Unblocking: %d user reply(ies) found", self._label, len(user_replies))
+            self.linear_issue_id = state.linear_issue_id
+            self.linear_project_id = state.linear_project_id
+            await self._run_linear_tracker(
+                f"Use save_issue to set Linear issue {self.linear_issue_id} state to 'In Progress'."
+            )
+            self.analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
+            if not await self._phase_write_spec(prior_comments=user_replies):
+                return
+            if not await self._phase_review_spec():
+                return
+            plan_result = await self._run_planner(self._prompt_plan())
+            self.tasks = _parse_task_list(plan_result)
+            if self.tasks and self.tasks[0].description.startswith("AMBIGUOUS:"):
+                await self._phase_blocked(self.tasks[0].description)
+                return
+            await self._phase_create_sub_issues()
+            logger.info("[%s] Unblock complete: %d sub-issue(s) created", self._label, len(self.tasks))
             return
 
         if state.in_review and state.pr_url:
@@ -457,7 +517,6 @@ class IssueWorkflow:
             self.linear_issue_id = state.linear_issue_id
             self.linear_project_id = state.linear_project_id
             if state.tasks:
-                # Already planned and sub-issues created — nothing to do
                 logger.info(
                     "[%s] Already planned with %d task(s) — skipping",
                     self._label, len(state.tasks),
@@ -468,8 +527,6 @@ class IssueWorkflow:
         need_linear = not state.found
         if need_linear:
             logger.info("[%s] Phase 1+2: Creating Linear issue + analyzing codebase in parallel", self._label)
-            # Codebase analysis runs freely; project creation is serialized per repo
-            # to prevent concurrent plan() calls from creating duplicate Linear projects.
             analysis_task = asyncio.create_task(
                 self._run_codebase_analyzer(self._prompt_analyze_codebase())
             )
@@ -480,18 +537,44 @@ class IssueWorkflow:
             self.analysis = await analysis_task
             logger.info("[%s] Linear issue: %s", self._label, self.linear_issue_id)
         else:
-            logger.info("[%s] Phase 2: Analyzing codebase", self._label)
+            logger.info("[%s] Phase 2: Analyzing codebase (attempting spec recovery)", self._label)
+            self.spec = await self._fetch_spec_from_linear() or ""
             self.analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
 
         if self.linear_issue_id:
             await self._run_linear_tracker(
                 f"Operation F: Add progress comment.\n"
                 f"Issue ID: {self.linear_issue_id}\n"
-                f"Comment: 🔍 **Codebase analyzed.** Planning implementation tasks..."
+                f"Comment: 🔍 **Codebase analyzed.** Writing specification..."
             )
 
-        # Phase 3 — Plan
-        logger.info("[%s] Phase 3: Planning tasks", self._label)
+        # Phase 2.5 — Write spec (skip if recovered from Linear)
+        if not self.spec:
+            logger.info("[%s] Phase 2.5: Writing spec", self._label)
+            if not await self._phase_write_spec():
+                return
+
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add progress comment.\n"
+                f"Issue ID: {self.linear_issue_id}\n"
+                f"Comment: 📝 **Spec written.** Reviewing against requirements..."
+            )
+
+        # Phase 2.7 — Spec reviewer verifies spec covers all requirements
+        logger.info("[%s] Phase 2.7: Reviewing spec", self._label)
+        if not await self._phase_review_spec():
+            return
+
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add progress comment.\n"
+                f"Issue ID: {self.linear_issue_id}\n"
+                f"Comment: ✅ **Spec approved.** Breaking into implementation tasks..."
+            )
+
+        # Phase 3 — Plan tasks from spec
+        logger.info("[%s] Phase 3: Planning tasks from spec", self._label)
         plan_result = await self._run_planner(self._prompt_plan())
         self.tasks = _parse_task_list(plan_result)
 
@@ -612,6 +695,191 @@ class IssueWorkflow:
     # ---------------------------------------------------------------------- #
     # Phase implementations                                                   #
     # ---------------------------------------------------------------------- #
+
+    async def _post_github_comment(self, body: str) -> None:
+        """Post a comment to the GitHub issue."""
+        try:
+            await _gh_subprocess(
+                ["issue", "comment", str(self.event.number),
+                 "--repo", self.event.repo_full_name, "--body", body],
+                cwd=self.repo_path,
+            )
+            logger.info("[%s] Posted GitHub comment on #%d", self._label, self.event.number)
+        except Exception as e:
+            logger.warning("[%s] Failed to post GitHub comment: %s", self._label, e)
+
+    async def _fetch_github_comments(self) -> list[dict]:
+        """Fetch all comments on the GitHub issue."""
+        try:
+            raw = await _gh_subprocess(
+                ["issue", "view", str(self.event.number),
+                 "--repo", self.event.repo_full_name, "--json", "comments"],
+                cwd=self.repo_path,
+            )
+            return json.loads(raw).get("comments", [])
+        except Exception as e:
+            logger.warning("[%s] Could not fetch GitHub comments: %s", self._label, e)
+            return []
+
+    async def _check_for_unblock(self) -> list[dict] | None:
+        """Return user reply comments after the bot's question, or None if still blocked."""
+        comments = await self._fetch_github_comments()
+        bot_marker = "I need some clarification before I can implement"
+        bot_idx = next(
+            (i for i, c in enumerate(comments) if bot_marker in c.get("body", "")), None
+        )
+        if bot_idx is None:
+            return None
+        user_replies = [
+            c for c in comments[bot_idx + 1:]
+            if c.get("author", {}).get("login") != settings.github_bot_login
+        ]
+        return user_replies if user_replies else None
+
+    async def _fetch_spec_from_linear(self) -> str | None:
+        """Recover previously written spec from the SPEC: tagged Linear comment."""
+        if not self.linear_issue_id:
+            return None
+        try:
+            raw = await self._run_linear_tracker(
+                f"Operation H: Fetch all comments for issue {self.linear_issue_id}."
+            )
+            start, end = raw.find('['), raw.rfind(']') + 1
+            if start != -1 and end > 0:
+                for comment in json.loads(raw[start:end]):
+                    if isinstance(comment, str) and comment.startswith("SPEC:"):
+                        return comment[len("SPEC:"):].strip()
+        except Exception:
+            pass
+        return None
+
+    async def _phase_write_spec(self, prior_comments: list[dict] | None = None) -> bool:
+        """Phase 2.5: Write a structured project spec. Returns True to continue, False if blocked."""
+        logger.info("[%s] Phase 2.5: Writing spec", self._label)
+
+        comments_section = ""
+        if prior_comments:
+            formatted = "\n".join(
+                f"@{c.get('author', {}).get('login', 'user')} "
+                f"({c.get('createdAt', '')}): {c.get('body', '')}"
+                for c in prior_comments
+            )
+            comments_section = (
+                f"\n\nGitHub clarification comments (user answers to your prior question):\n"
+                f"{formatted}"
+            )
+
+        prompt = (
+            f"Write a complete project spec for this GitHub issue.\n\n"
+            f"Issue title: {self.event.title}\n"
+            f"Issue URL: {self.event.html_url}\n"
+            f"Issue body:\n{self.event.body or '(no body)'}\n\n"
+            f"Codebase Analysis:\n{self.analysis}"
+            f"{comments_section}"
+        )
+
+        result = await self._run_spec_writer(prompt)
+
+        if result.strip().startswith("AMBIGUOUS:"):
+            ambiguous_text = result.strip()[len("AMBIGUOUS:"):].strip()
+
+            # Duplicate-post guard: only post if we haven't already asked
+            existing = await self._fetch_github_comments()
+            bot_marker = "I need some clarification before I can implement"
+            already_asked = any(bot_marker in c.get("body", "") for c in existing)
+
+            if not already_asked:
+                await self._post_github_comment(
+                    "I need some clarification before I can implement this issue:\n\n"
+                    f"{ambiguous_text}"
+                )
+
+            await self._phase_blocked(f"Spec writer needs clarification: {ambiguous_text[:200]}")
+            return False
+
+        self.spec = result
+
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add progress comment.\n"
+                f"Issue ID: {self.linear_issue_id}\n"
+                f"Comment: SPEC:\n{self.spec}"
+            )
+
+        return True
+
+    async def _phase_review_spec(self) -> bool:
+        """Phase 2.7: Verify spec covers all issue requirements. Returns True to continue."""
+        logger.info("[%s] Phase 2.7: Reviewing spec against issue requirements", self._label)
+
+        prompt = (
+            f"Review this spec against the original GitHub issue requirements.\n\n"
+            f"Original issue title: {self.event.title}\n"
+            f"Original issue body:\n{self.event.body or '(no body)'}\n\n"
+            f"Spec to review:\n{self.spec}"
+        )
+        result = await self._run_spec_reviewer(prompt)
+
+        if not result.strip().startswith("NEEDS_REVISION:"):
+            logger.info("[%s] Spec reviewer: APPROVED", self._label)
+            return True
+
+        revision_notes = result.strip()[len("NEEDS_REVISION:"):].strip()
+        logger.info("[%s] Spec reviewer requested revisions — running one revision cycle", self._label)
+
+        revised = await self._run_spec_writer(
+            f"Revise your spec based on the following reviewer feedback:\n\n"
+            f"{revision_notes}\n\n"
+            f"Original issue title: {self.event.title}\n"
+            f"Original issue body:\n{self.event.body or '(no body)'}\n\n"
+            f"Your previous spec:\n{self.spec}\n\n"
+            f"Codebase Analysis:\n{self.analysis}"
+        )
+
+        if revised.strip().startswith("AMBIGUOUS:"):
+            ambiguous_text = revised.strip()[len("AMBIGUOUS:"):].strip()
+            await self._phase_blocked(f"Spec revision raised new ambiguity: {ambiguous_text[:200]}")
+            return False
+
+        self.spec = revised
+
+        re_review = await self._run_spec_reviewer(
+            f"Review this revised spec against the original GitHub issue.\n\n"
+            f"Original issue title: {self.event.title}\n"
+            f"Original issue body:\n{self.event.body or '(no body)'}\n\n"
+            f"Revised spec:\n{self.spec}"
+        )
+
+        if re_review.strip().startswith("NEEDS_REVISION:"):
+            remaining = re_review.strip()[len("NEEDS_REVISION:"):].strip()
+            await self._phase_blocked(
+                f"Spec still has gaps after revision: {remaining[:300]}"
+            )
+            return False
+
+        logger.info("[%s] Spec reviewer: APPROVED after revision", self._label)
+        # Update the stored spec comment with the reviewed version
+        if self.linear_issue_id:
+            await self._run_linear_tracker(
+                f"Operation F: Add progress comment.\n"
+                f"Issue ID: {self.linear_issue_id}\n"
+                f"Comment: SPEC:\n{self.spec}"
+            )
+        return True
+
+    async def _update_spec_progress(self) -> None:
+        """Cross off all acceptance criteria in the SPEC: Linear comment after PR submission."""
+        if not self.spec or not self.linear_issue_id:
+            return
+        updated_spec = self.spec.replace("- [ ]", "- [x]")
+        if updated_spec == self.spec:
+            return
+        self.spec = updated_spec
+        await self._run_linear_tracker(
+            f"Operation F: Add progress comment.\n"
+            f"Issue ID: {self.linear_issue_id}\n"
+            f"Comment: SPEC (completed ✅):\n{self.spec}"
+        )
 
     async def _phase_check_linear(self) -> LinearState:
         logger.info("[%s] Phase 0.5: Checking Linear state", self._label)
@@ -870,6 +1138,7 @@ class IssueWorkflow:
         )
         self.pr_url = _extract_pr_url(result)
         logger.info("[%s] PR URL: %s", self._label, self.pr_url)
+        await self._update_spec_progress()
 
     async def _phase_reconcile_subtasks(self) -> None:
         """Safety net: mark any lingering sub-tasks as Done before final update."""
@@ -938,19 +1207,24 @@ class IssueWorkflow:
         )
 
     def _prompt_plan(self) -> str:
+        issue_context = (
+            self.spec if self.spec else
+            f"Issue title: {self.event.title}\nIssue body: {self.event.body or '(no body)'}"
+        )
         return (
-            f"Break this GitHub issue into implementation tasks.\n\n"
-            f"Issue title: {self.event.title}\n"
-            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Break this project spec into implementation tasks.\n\n"
+            f"{issue_context}\n\n"
             f"Codebase Analysis:\n{self.analysis}\n\n"
             f"Return a raw JSON array of tasks only."
         )
 
     def _prompt_coder_task(self, task: Task) -> str:
+        spec_section = f"\nProject Spec:\n{self.spec}\n" if self.spec else ""
         return (
             f"Implement this specific task for GitHub issue #{self.event.number}.\n\n"
             f"Issue title: {self.event.title}\n"
-            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Issue body: {self.event.body or '(no body)'}\n"
+            f"{spec_section}\n"
             f"Codebase Analysis:\n{self.analysis}\n\n"
             f"Task title: {task.title}\n"
             f"Task description: {task.description}\n"
@@ -971,10 +1245,15 @@ class IssueWorkflow:
 
     def _prompt_review(self) -> str:
         files_list = "\n".join(f"- {f}" for f in self.modified_files) or "(check git diff)"
+        spec_section = (
+            f"\nProject Spec (use the Acceptance Criteria as your review checklist):\n{self.spec}\n"
+            if self.spec else ""
+        )
         return (
             f"Review the code changes made for GitHub issue #{self.event.number}.\n\n"
             f"Issue title: {self.event.title}\n"
-            f"Issue body: {self.event.body or '(no body)'}\n\n"
+            f"Issue body: {self.event.body or '(no body)'}\n"
+            f"{spec_section}\n"
             f"Modified files:\n{files_list}\n\n"
             f"Local repo path: {self.repo_path}\n\n"
             f"Return ONLY the JSON result object — no preamble, no markdown."

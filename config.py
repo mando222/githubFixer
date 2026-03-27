@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     linear_agent_model: str = "claude-haiku-4-5-20251001"
     analyzer_agent_model: str = "claude-haiku-4-5-20251001"
     planner_agent_model: str = "claude-haiku-4-5-20251001"
+    spec_writer_agent_model: str = "claude-sonnet-4-6"  # override to claude-opus-4-6 via .env
+    spec_reviewer_agent_model: str = "claude-sonnet-4-6"
 
     # Concurrency — direct Linear MCP supports concurrent connections
     max_concurrent_issues: int = 3
@@ -36,7 +38,10 @@ class Settings(BaseSettings):
     issue_timeout_seconds: int = 1800  # 30 minutes
 
     # How long (seconds) to allow planning phases (0.5-4) before timing out
-    planning_timeout_seconds: int = 600  # 10 minutes
+    planning_timeout_seconds: int = 900  # 15 minutes (increased for spec writer + reviewer phases)
+
+    # GitHub bot login used to filter out bot comments when detecting user replies
+    github_bot_login: str = "github-actions[bot]"
 
     # Max code→test→fix cycles before blocking (high to allow full self-correction)
     max_remediation_cycles: int = 12

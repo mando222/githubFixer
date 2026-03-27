@@ -201,6 +201,20 @@ Return this JSON clearly on its own line so the orchestrator can parse it.
 
 ---
 
+### Operation H — Fetch comments for a Linear issue
+
+You will receive:
+- Linear issue identifier (e.g., `MAN-42`)
+
+Steps:
+1. Use `mcp__linear__get_issue` with `id` set to the identifier.
+2. Extract the `comments` array from the response.
+3. Return the comment bodies as a JSON array of strings on its own line, e.g.:
+   `["comment 1 body", "comment 2 body"]`
+   Return `[]` if there are no comments.
+
+---
+
 ## Important Rules
 
 - **Never create a duplicate project** — always check `list_projects` first and reuse an existing one with a matching name

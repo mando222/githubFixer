@@ -35,7 +35,15 @@ class TaskRunner:
         async with self._semaphore:
             try:
                 from agents.orchestrator import run_issue_workflow
-                await run_issue_workflow(event)
+                await asyncio.wait_for(
+                    run_issue_workflow(event),
+                    timeout=settings.issue_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Issue %s timed out after %ds — killing workflow",
+                    key, settings.issue_timeout_seconds,
+                )
             except Exception:
                 logger.exception("Unhandled error processing issue %s", key)
             finally:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from arcade_config import ARCADE_LINEAR_TOOLS
+from linear_config import LINEAR_TOOLS
 from config import settings
 from prompts import load_prompt
 
@@ -74,7 +74,7 @@ def make_linear_tracker() -> AgentDefinition:
             "Returns Linear issue IDs or confirmation."
         ),
         prompt=load_prompt("linear_tracker"),
-        tools=ARCADE_LINEAR_TOOLS,
+        tools=LINEAR_TOOLS,
         model=_shortname(settings.linear_agent_model),
     )
 

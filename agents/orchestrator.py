@@ -974,12 +974,15 @@ class IssueWorkflow:
                 t.status = "in_progress"
 
         # 5b — Execute each batch in parallel
+        self._validate_batch_file_safety()
         batches = self._build_batches()
         logger.info("[%s] Phase 5b: %d batch(es), %d task(s)", self._label, len(batches), len(self.tasks))
 
         for batch_idx, batch in enumerate(batches):
             logger.info("[%s] Batch %d: executing %d task(s) in parallel", self._label, batch_idx, len(batch))
+            pre_sha = await self._git_head_sha()
             results = await asyncio.gather(*[self._run_coder(self._prompt_coder_task(t)) for t in batch])
+            await self._audit_undeclared_writes(batch_idx, batch, pre_sha)
 
             for task, result in zip(batch, results):
                 if "## Cannot Implement" in result:
@@ -1300,11 +1303,28 @@ class IssueWorkflow:
         except Exception:
             return False
 
-    async def _get_modified_files_from_git(self) -> list[str]:
-        """Return the list of files changed since the last commit via git diff."""
+    async def _git_head_sha(self) -> str | None:
+        """Return the current HEAD commit SHA, or None if unavailable."""
         try:
             proc = await asyncio.create_subprocess_shell(
-                "git diff --name-only HEAD",
+                "git rev-parse HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.repo_path),
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            sha = stdout.decode().strip()
+            return sha if sha else None
+        except Exception:
+            return None
+
+    async def _get_modified_files_from_git(self, base_sha: str | None = None) -> list[str]:
+        """Return the list of files changed since base_sha (or HEAD if None)."""
+        ref = base_sha if base_sha else "HEAD"
+        cmd = f"git diff --name-only {ref}" if base_sha else "git diff --name-only HEAD"
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.repo_path),
@@ -1318,6 +1338,61 @@ class IssueWorkflow:
             pass
         # Fall back to the heuristic list accumulated during coding
         return self.modified_files
+
+    def _validate_batch_file_safety(self) -> None:
+        """Add depends_on for any pending tasks in the same batch that share files_hint.
+
+        The planner is instructed to handle this, but if it misses an overlap this
+        acts as a deterministic safety net: it scans all task-index pairs that would
+        land in the same batch and enforces sequential ordering for any pair that
+        declares the same file.  Only pending/in-progress tasks are considered.
+        """
+        task_files = [set(t.files_hint) for t in self.tasks]
+        for i, ti in enumerate(self.tasks):
+            if ti.status == "done":
+                continue
+            for j, tj in enumerate(self.tasks):
+                if j <= i or tj.status == "done":
+                    continue
+                # Only relevant if neither already depends on the other
+                if i in tj.depends_on or j in ti.depends_on:
+                    continue
+                overlap = task_files[i] & task_files[j]
+                if overlap:
+                    tj.depends_on.append(i)
+                    logger.warning(
+                        "[%s] Batch safety: added depends_on %d→%d for shared files %s",
+                        self._label,
+                        i,
+                        j,
+                        sorted(overlap),
+                    )
+
+    async def _audit_undeclared_writes(
+        self, batch_idx: int, batch: list[Task], pre_sha: str | None
+    ) -> None:
+        """Compare files actually written by this batch against declared files_hint.
+
+        Any file modified but not declared in any task's files_hint is logged as a
+        warning.  This doesn't prevent the conflict but makes the gap visible so the
+        planner prompt can be improved over time.
+        """
+        if not pre_sha:
+            return
+        actual = set(await self._get_modified_files_from_git(base_sha=pre_sha))
+        if not actual:
+            return
+        declared = {f for t in batch for f in t.files_hint}
+        undeclared = actual - declared
+        if undeclared:
+            logger.warning(
+                "[%s] Batch %d: agents wrote %d file(s) not in files_hint — "
+                "potential undeclared conflict: %s",
+                self._label,
+                batch_idx,
+                len(undeclared),
+                sorted(undeclared),
+            )
 
     def _build_batches(self) -> list[list[Task]]:
         """Group tasks into dependency-ordered batches for parallel execution."""

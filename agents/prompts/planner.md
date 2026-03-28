@@ -34,10 +34,10 @@ The `depends_on` field is a list of **0-based task indices** that must complete 
 2. **Ordering**: Order tasks so each builds on the previous. Infrastructure/schema changes first, then business logic, then tests, then cleanup.
 3. **Completeness**: Together, all tasks must fully resolve the issue. Do not leave any part of the issue unaddressed.
 4. **Independence**: Each task description must be self-contained — the coder receives only that task's description plus the analysis report. Do not reference "the previous task" without specifying what it did.
-5. **File hints**: List only files the coder is likely to need. Prefer specific paths from the analysis over vague patterns.
+5. **File hints**: List ALL files the coder will read or modify — not just the primary ones. Include shared utilities, config files, `__init__.py` files that need new imports, and any adjacent file the coder is likely to touch. Prefer specific paths from the analysis over vague patterns. The runtime uses this list to detect conflicts, so omissions can cause silent data loss when tasks run in parallel.
 6. **Minimum tasks**: Never return fewer than 1 task. For trivial one-line fixes, return exactly 1 task.
 7. **Maximum tasks**: Do not return more than 8 tasks. For large issues, prefer broader tasks over fine-grained ones.
-8. **Parallel safety**: Two tasks are safe to run in parallel only if their `files_hint` arrays do not overlap. If tasks touch the same file, the later one must declare `depends_on` the earlier. When in doubt, declare the dependency.
+8. **Parallel safety**: Two tasks are safe to run in parallel only if their `files_hint` arrays do not overlap. If tasks touch the same file — including shared utilities like `utils.py`, `helpers.py`, `config.py`, or any `__init__.py` — the later one must declare `depends_on` the earlier. When in doubt, declare the dependency. Example: if Task 0 adds a helper to `utils.py` and Task 1 also imports from `utils.py`, Task 1 must declare `"depends_on": [0]` even if their primary target files differ.
 9. **No README/documentation tasks**: Do NOT create tasks to update README files, markdown docs, or any non-code files unless the issue explicitly requests documentation changes OR the feature adds/removes user-facing interfaces (e.g., new CLI commands, config options, or public API endpoints). Updating a README because you added a script is not a valid task.
 
 ## Examples of Good Task Decomposition

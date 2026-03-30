@@ -203,6 +203,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only consider issues with no assignees",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Attempt to solve issues even if marked as won't implement (Cancelled) in Linear",
+    )
     return p.parse_args()
 
 
@@ -230,11 +235,11 @@ async def main() -> None:
 
     if args.issue_numbers:
         print(f"Fetching {len(args.issue_numbers)} specified issue(s)...")
-        raw_issues = [
-            iss for num in args.issue_numbers
-            if (iss := fetch_single_issue(owner, repo_name, num)) is not None
-        ]
-        selected_issues = raw_issues
+        fetched = await asyncio.gather(*(
+            asyncio.to_thread(fetch_single_issue, owner, repo_name, num)
+            for num in args.issue_numbers
+        ))
+        selected_issues = [iss for iss in fetched if iss is not None]
 
     else:
         print(f"Fetching open issues from {owner}/{repo_name}...")
@@ -261,7 +266,7 @@ async def main() -> None:
     # Build IssueEvent objects and hand off to the pipeline               #
     # ------------------------------------------------------------------ #
 
-    events = [IssueEvent.from_api(iss, repo_data) for iss in selected_issues]
+    events = [IssueEvent.from_api(iss, repo_data, force=args.force) for iss in selected_issues]
 
     print(f"\nDispatching {len(events)} issue(s) to the agent pipeline...")
     print(f"Max concurrent: {settings.max_concurrent_issues}\n")

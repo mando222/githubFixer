@@ -557,28 +557,40 @@ class IssueWorkflow:
 
         # Handle previously blocked issues: check if user replied on GitHub
         if state.blocked:
-            user_replies = await self._check_for_unblock()
-            if user_replies is None:
-                logger.info("[%s] Previously blocked — no user reply yet, skipping", self._label)
+            if self.event.force:
+                logger.info("[%s] --force: overriding blocked/cancelled state, re-activating", self._label)
+                self.linear_issue_id = state.linear_issue_id
+                self.linear_project_id = state.linear_project_id
+                await self._linear.update_state(self.linear_issue_id, "In Progress")
+                # Synthesize a non-blocked state so planning continues normally below
+                state = LinearState(
+                    found=True,
+                    linear_issue_id=state.linear_issue_id,
+                    linear_project_id=state.linear_project_id,
+                )
+            else:
+                user_replies = await self._check_for_unblock()
+                if user_replies is None:
+                    logger.info("[%s] Previously blocked — no user reply yet, skipping", self._label)
+                    return
+                # User replied — reactivate Linear issue, re-analyze, re-spec, re-plan
+                logger.info("[%s] Unblocking: %d user reply(ies) found", self._label, len(user_replies))
+                self.linear_issue_id = state.linear_issue_id
+                self.linear_project_id = state.linear_project_id
+                await self._linear.update_state(self.linear_issue_id, "In Progress")
+                self.analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
+                if not await self._phase_write_spec(prior_comments=user_replies):
+                    return
+                if not await self._phase_review_spec():
+                    return
+                plan_result = await self._run_planner(self._prompt_plan())
+                self.tasks = _parse_task_list(plan_result)
+                if self.tasks and self.tasks[0].description.startswith("AMBIGUOUS:"):
+                    await self._phase_blocked(self.tasks[0].description)
+                    return
+                await self._phase_create_linear_issues()
+                logger.info("[%s] Unblock complete: %d sub-issue(s) created", self._label, len(self.tasks))
                 return
-            # User replied — reactivate Linear issue, re-analyze, re-spec, re-plan
-            logger.info("[%s] Unblocking: %d user reply(ies) found", self._label, len(user_replies))
-            self.linear_issue_id = state.linear_issue_id
-            self.linear_project_id = state.linear_project_id
-            await self._linear.update_state(self.linear_issue_id, "In Progress")
-            self.analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
-            if not await self._phase_write_spec(prior_comments=user_replies):
-                return
-            if not await self._phase_review_spec():
-                return
-            plan_result = await self._run_planner(self._prompt_plan())
-            self.tasks = _parse_task_list(plan_result)
-            if self.tasks and self.tasks[0].description.startswith("AMBIGUOUS:"):
-                await self._phase_blocked(self.tasks[0].description)
-                return
-            await self._phase_create_linear_issues()
-            logger.info("[%s] Unblock complete: %d sub-issue(s) created", self._label, len(self.tasks))
-            return
 
         if state.in_review and state.pr_url:
             pr_st = await self._pr_state(state.pr_url)
@@ -673,8 +685,11 @@ class IssueWorkflow:
         state = await self._phase_check_linear()
 
         if state.blocked:
-            logger.info("[%s] Blocked in Linear — skipping coding", self._label)
-            return True
+            if self.event.force:
+                logger.info("[%s] --force: overriding blocked/cancelled state in coding phase", self._label)
+            else:
+                logger.info("[%s] Blocked in Linear — skipping coding", self._label)
+                return True
 
         if state.in_review and state.pr_url:
             pr_st = await self._pr_state(state.pr_url)

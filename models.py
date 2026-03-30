@@ -30,13 +30,14 @@ class IssueEvent:
     clone_url: str
     html_url: str         # issue URL
     repo_html_url: str    # repo URL
+    force: bool = False   # bypass won't-implement / Cancelled state checks
 
     # ------------------------------------------------------------------ #
     # Constructors                                                         #
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_api(cls, issue: dict, repo: dict) -> "IssueEvent":
+    def from_api(cls, issue: dict, repo: dict, *, force: bool = False) -> "IssueEvent":
         """Build from gh CLI output objects.
 
         ``issue`` is a single item from ``gh issue list/view --json``.
@@ -59,6 +60,7 @@ class IssueEvent:
             clone_url=repo["clone_url"],
             html_url=issue_url,
             repo_html_url=repo_html_url,
+            force=force,
         )
 
     @classmethod

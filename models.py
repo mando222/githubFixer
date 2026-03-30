@@ -1,25 +1,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-
-
-@dataclass
-class Task:
-    """A single implementation task returned by the planner agent."""
-    title: str
-    description: str
-    files_hint: list[str] = field(default_factory=list)
-    acceptance: str = ""
+from dataclasses import dataclass
 
 
 @dataclass
 class IssueEvent:
-    """Represents a GitHub issue to be solved.
-
-    Can be constructed from a raw GitHub REST API issue object
-    (via ``from_api``) or from a legacy webhook payload (``from_payload``).
-    """
+    """Represents a GitHub issue to be solved."""
 
     number: int
     title: str
@@ -61,23 +48,6 @@ class IssueEvent:
             html_url=issue_url,
             repo_html_url=repo_html_url,
             force=force,
-        )
-
-    @classmethod
-    def from_payload(cls, payload: dict) -> "IssueEvent":
-        """Build from a GitHub webhook ``issues`` event payload (legacy)."""
-        issue = payload["issue"]
-        repo = payload["repository"]
-        return cls(
-            number=issue["number"],
-            title=issue["title"],
-            body=issue.get("body") or "",
-            repo_full_name=repo["full_name"],
-            repo_name=repo["name"],
-            repo_owner=repo["owner"]["login"],
-            clone_url=repo["clone_url"],
-            html_url=issue["html_url"],
-            repo_html_url=repo["html_url"],
         )
 
     # ------------------------------------------------------------------ #

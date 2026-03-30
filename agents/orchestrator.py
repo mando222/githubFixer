@@ -9,8 +9,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from agents.definitions import AGENT_MODELS
 from config import settings
+
+AGENT_MODELS: dict[str, str] = {
+    "codebase-analyzer": settings.analyzer_agent_model,
+    "coder":             settings.coding_agent_model,
+    "tester":            settings.tester_agent_model,
+    "reviewer":          settings.reviewer_agent_model,
+    "github-submitter":  settings.github_agent_model,
+    "planner":           settings.planner_agent_model,
+    "spec-writer":       settings.spec_writer_agent_model,
+    "spec-reviewer":     settings.spec_reviewer_agent_model,
+}
 from linear_client import LinearState, LinearTask, get_linear_client
 from prompts import load_prompt
 from security import bash_security_hook

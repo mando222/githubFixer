@@ -4,67 +4,19 @@ token_tracker.py — Token usage tracking for github-fixer.
 Pulls data from two sources:
   1. ~/.claude/stats-cache.json  — Claude Code's own token accounting (daily + cumulative)
   2. RateLimitEvent messages     — Claude's live rate-limit utilization per window type
-
-Also writes a per-issue JSONL log to ~/.github-fixer/token_usage.jsonl.
 """
 from __future__ import annotations
 
 import json
 import logging
-import threading
-from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-TRACKER_DIR = Path.home() / ".github-fixer"
-USAGE_FILE = TRACKER_DIR / "token_usage.jsonl"
 STATS_CACHE = Path.home() / ".claude" / "stats-cache.json"
 
-_write_lock = threading.Lock()
-
 SEP = "─" * 80
-
-
-# --------------------------------------------------------------------------- #
-# Per-issue JSONL record                                                        #
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class UsageRecord:
-    timestamp: str
-    issue_ref: str
-    input_tokens: int
-    output_tokens: int
-    cache_creation_tokens: int
-    cache_read_tokens: int
-    cost_usd: float
-
-
-def record_usage(
-    issue_ref: str,
-    usage: dict | None,
-    cost_usd: float | None,
-) -> None:
-    """Append one per-issue usage record to USAGE_FILE. Never raises."""
-    try:
-        record = UsageRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            issue_ref=issue_ref,
-            input_tokens=int((usage or {}).get("input_tokens", 0)),
-            output_tokens=int((usage or {}).get("output_tokens", 0)),
-            cache_creation_tokens=int((usage or {}).get("cache_creation_input_tokens", 0)),
-            cache_read_tokens=int((usage or {}).get("cache_read_input_tokens", 0)),
-            cost_usd=float(cost_usd or 0.0),
-        )
-        TRACKER_DIR.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(asdict(record)) + "\n"
-        with _write_lock:
-            with USAGE_FILE.open("a", encoding="utf-8") as f:
-                f.write(line)
-    except Exception:
-        logger.warning("Failed to record token usage", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #

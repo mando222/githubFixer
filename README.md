@@ -55,13 +55,27 @@ python run.py owner/repo --all
 
 # Only consider unassigned issues
 python run.py owner/repo --unassigned
+
+# Force-solve an issue even if it's closed or marked won't-implement
+python run.py owner/repo 42 --force
+python run.py owner/repo --all --force
 ```
+
+### `--force`
+
+By default the pipeline skips issues whose Linear state is `Cancelled` or `Won't Implement`. Pass `--force` to override that check — the issue is reactivated to *In Progress* and the full pipeline runs regardless of its current state. Useful for revisiting deliberately-closed tickets or retrying a previously-rejected fix.
 
 ### Example
 
 ```bash
 python run.py mando222/my-project --all
+python run.py mando222/my-project 42 67 100        # three issues in parallel
+python run.py mando222/my-project 55 --force       # reopen and retry a closed issue
 ```
+
+### Parallel execution
+
+Whether you pass `--all` or explicit issue numbers, all selected issues are dispatched concurrently up to `MAX_CONCURRENT_ISSUES` (default: 3). Each issue gets its own isolated git worktree and independent agent pipeline — they do not share state or block each other.
 
 The pipeline will run fully autonomously for each issue:
 1. Analyze the codebase

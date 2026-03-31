@@ -93,15 +93,19 @@ The pipeline will run fully autonomously for each issue:
 6. Open a PR on GitHub
 7. Mark the Linear ticket "In Review" with the PR link
 
-## Cost Savings with Ollama
+## Ollama Integration
 
-By default every agent runs on Claude. Two of the agents — the **task planner** and the **spec reviewer** — do pure text reasoning with no tool use. These can optionally be offloaded to a local [Ollama](https://ollama.com) instance at zero API cost, while keeping the complex agents (coder, tester, reviewer) on Claude where quality matters.
+Two agents — the **task planner** and the **spec reviewer** — do pure text reasoning with no tool use and can optionally run on a local [Ollama](https://ollama.com) instance. All other agents require Claude Code tool use (Read, Write, Edit, Bash, etc.) and must stay on Claude.
 
-| Agent | Default model | Ollama option |
+| Agent | Default model | Ollama? |
 |---|---|---|
-| Spec reviewer | Claude Haiku | ✅ Binary APPROVED/NEEDS_REVISION output — works well locally |
-| Task planner | Claude Haiku | ✅ JSON task list — works well with a capable model |
-| Coder / Tester / Reviewer | Claude Sonnet | ❌ Requires Claude Code tool use |
+| Spec reviewer | Claude Haiku | ✅ Binary APPROVED/NEEDS_REVISION output |
+| Task planner | Claude Haiku | ✅ JSON task list output |
+| Codebase analyzer | Claude Haiku | ❌ Requires Read/Glob/Grep tools |
+| Coder | Claude Sonnet | ❌ Requires Read/Write/Edit/Bash tools |
+| Tester | Claude Sonnet | ❌ Requires Bash/Read tools |
+| Reviewer | Claude Sonnet | ❌ Requires Bash/Read/Glob/Grep tools |
+| GitHub submitter | Claude Haiku | ❌ Requires Bash/Read tools |
 
 ### Setup
 

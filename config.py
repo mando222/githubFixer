@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # Max fix tasks spawned per review cycle (prevents coder explosion when reviewer lists many issues)
     max_fix_tasks_per_review_cycle: int = 3
 
+    # Ollama — optional local LLM for tool-free agents (zero API cost)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:14b"
+    ollama_for_planner: bool = False        # env: USE_OLLAMA_FOR_PLANNER=true
+    ollama_for_spec_reviewer: bool = False  # env: USE_OLLAMA_FOR_SPEC_REVIEWER=true
+
 
 
 @lru_cache

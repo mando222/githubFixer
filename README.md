@@ -8,6 +8,7 @@ Automatically resolves GitHub issues using a multi-agent Claude pipeline. Point 
 - [Claude Code CLI](https://claude.ai/code) installed and authenticated
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - A [Linear](https://linear.app) workspace with an API key
+- (Optional) [Ollama](https://ollama.com) for local LLM cost savings — see [Cost Savings with Ollama](#cost-savings-with-ollama)
 
 ## Installation
 
@@ -32,6 +33,12 @@ LINEAR_TEAM_ID=your-team-id
 
 # Optional — concurrency
 # MAX_CONCURRENT_ISSUES=3
+
+# Optional — Ollama (see Cost Savings section below)
+# USE_OLLAMA_FOR_PLANNER=true
+# USE_OLLAMA_FOR_SPEC_REVIEWER=true
+# OLLAMA_MODEL=qwen2.5:14b
+# OLLAMA_BASE_URL=http://localhost:11434
 ```
 
 Claude authentication is handled through the Claude Code CLI — no API key needed here. Make sure you're logged in (`claude`) before running.
@@ -85,3 +92,40 @@ The pipeline will run fully autonomously for each issue:
 5. Review the implementation against the spec
 6. Open a PR on GitHub
 7. Mark the Linear ticket "In Review" with the PR link
+
+## Cost Savings with Ollama
+
+By default every agent runs on Claude. Two of the agents — the **task planner** and the **spec reviewer** — do pure text reasoning with no tool use. These can optionally be offloaded to a local [Ollama](https://ollama.com) instance at zero API cost, while keeping the complex agents (coder, tester, reviewer) on Claude where quality matters.
+
+| Agent | Default model | Ollama option |
+|---|---|---|
+| Spec reviewer | Claude Haiku | ✅ Binary APPROVED/NEEDS_REVISION output — works well locally |
+| Task planner | Claude Haiku | ✅ JSON task list — works well with a capable model |
+| Coder / Tester / Reviewer | Claude Sonnet | ❌ Requires Claude Code tool use |
+
+### Setup
+
+```bash
+# Install Ollama and pull a model
+brew install ollama        # or https://ollama.com/download
+ollama pull qwen2.5:14b   # recommended — strong JSON/instruction following
+ollama serve
+```
+
+Add to your `.env`:
+
+```env
+USE_OLLAMA_FOR_PLANNER=true
+USE_OLLAMA_FOR_SPEC_REVIEWER=true
+OLLAMA_MODEL=qwen2.5:14b
+```
+
+### Model recommendations
+
+- **`qwen2.5:14b`** — best choice, strong instruction following, reliable JSON output
+- **`llama3.1:8b`** — lighter/faster, works well for the spec reviewer
+- **`mistral:7b`** — acceptable, may add markdown fences around JSON (handled gracefully)
+
+If Ollama isn't running, the system falls back to Claude automatically within 5 seconds — no workflow interruption.
+
+> **Context length:** The planner receives 3–6K tokens of input. If you hit issues, set `OLLAMA_NUM_CTX=8192` via an Ollama [Modelfile](https://github.com/ollama/ollama/blob/main/docs/modelfile.md).

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,10 +250,13 @@ async def _run_ollama_with_fallback(
     return await _run_agent(client, task_prompt, label)
 
 
+_GH_BIN: str = shutil.which("gh") or "gh"
+
+
 async def _gh_subprocess(args: list[str], cwd: Path, timeout: float = 30.0) -> str:
     """Run a gh CLI command and return stdout. Raises RuntimeError on non-zero exit."""
     proc = await asyncio.create_subprocess_exec(
-        "gh", *args,
+        _GH_BIN, *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd),

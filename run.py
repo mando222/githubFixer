@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import shutil
 import subprocess
 import sys
 
@@ -53,8 +54,9 @@ logger = logging.getLogger(__name__)
 
 def _gh(args: list[str]) -> list | dict:
     """Run a gh CLI command with --json and return parsed output."""
+    gh = shutil.which("gh") or "gh"
     result = subprocess.run(
-        ["gh"] + args,
+        [gh] + args,
         capture_output=True,
         text=True,
     )

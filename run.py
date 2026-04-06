@@ -36,7 +36,7 @@ import sys
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 from config import settings
 from models import IssueEvent

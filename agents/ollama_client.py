@@ -2,9 +2,9 @@
 agents/ollama_client.py
 
 Minimal async client for the Ollama OpenAI-compatible chat completions endpoint.
-Used only for tool-free agents (spec_reviewer, planner) as a zero-cost alternative
-to Claude API calls. Agents that require tool use (coder, tester, etc.) cannot use
-this client and must continue using the Claude SDK.
+Used for tool-free agents (spec_reviewer, planner) as a zero-cost alternative
+to Anthropic API calls. Agents that require tool use (coder, tester, etc.) cannot use
+this client and must use the Anthropic API or Codex backend instead.
 """
 from __future__ import annotations
 

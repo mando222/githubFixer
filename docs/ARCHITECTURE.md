@@ -61,9 +61,13 @@ githubFixer/
 ├── requirements.txt          # Python dependencies
 │
 ├── agents/
-│   ├── definitions.py        # AgentDefinition builders — wraps claude_agent_sdk.Agent
+│   ├── definitions.py        # AgentDefinition dataclass + AGENT_MODELS / CODEX_AGENT_MODELS dicts
 │   ├── orchestrator.py       # Main state machine — IssueWorkflow class (~1750 lines)
+│   ├── anthropic_client.py   # Direct Anthropic API client with full agentic tool loop
+│   ├── codex_client.py       # OpenAI Codex CLI subprocess adapter (optional backend)
 │   ├── ollama_client.py      # OpenAI-compat client for local Ollama inference
+│   ├── tools.py              # Tool schemas + Python executors (Read/Write/Edit/Glob/Grep/Bash)
+│   ├── types.py              # Local message dataclasses (AssistantMessage, TextBlock, etc.)
 │   │
 │   └── prompts/              # System prompts for each agent (Markdown)
 │       ├── orchestrator.md       # Legacy reference (logic now in Python)
@@ -600,6 +604,22 @@ All settings are loaded from `.env` via Pydantic `BaseSettings` (`config.py`).
 |----------|---------|
 | `LINEAR_API_KEY` | Linear GraphQL API authentication token |
 | `LINEAR_TEAM_ID` | UUID of the Linear team that owns created issues |
+| `ANTHROPIC_API_KEY` | Anthropic API key (required when `AGENT_BACKEND=anthropic`, the default) |
+
+### Backend Selection
+
+| Variable | Default | Options |
+|----------|---------|---------|
+| `AGENT_BACKEND` | `anthropic` | `anthropic` — direct API; `codex` — Codex CLI |
+| `CODER_AGENT_BACKEND` | _(use global)_ | Per-agent override of `AGENT_BACKEND` |
+| `TESTER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `REVIEWER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `ANALYZER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `PLANNER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `SPEC_WRITER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `SPEC_REVIEWER_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `GITHUB_AGENT_BACKEND` | _(use global)_ | Per-agent override |
+| `MAX_TOKENS_PER_AGENT` | `16384` | Max output tokens per Anthropic API call |
 
 ### Model Selection
 
@@ -626,13 +646,30 @@ All settings are loaded from `.env` via Pydantic `BaseSettings` (`config.py`).
 | `MAX_REMEDIATION_CYCLES` | `3` | Test-fix loop iterations |
 | `MAX_REVIEW_CYCLES` | `2` | Code review-fix loop iterations |
 
-### Ollama
+### Codex CLI Backend
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CODEX_CODER_MODEL` | `o4-mini` | OpenAI model for Coder agent |
+| `CODEX_TESTER_MODEL` | `o4-mini` | OpenAI model for Tester agent |
+| `CODEX_REVIEWER_MODEL` | `o4-mini` | OpenAI model for Reviewer agent |
+| `CODEX_ANALYZER_MODEL` | `o4-mini` | OpenAI model for Analyzer agent |
+| `CODEX_PLANNER_MODEL` | `o4-mini` | OpenAI model for Planner agent |
+| `CODEX_SPEC_WRITER_MODEL` | `o4-mini` | OpenAI model for Spec Writer agent |
+| `CODEX_SPEC_REVIEWER_MODEL` | `o4-mini` | OpenAI model for Spec Reviewer agent |
+| `CODEX_GITHUB_MODEL` | `o4-mini` | OpenAI model for GitHub Submitter agent |
+| `CODEX_TIMEOUT_SECONDS` | `600` | Per-call subprocess timeout (seconds) |
+
+### Ollama (Local Inference)
+
+Ollama is a valid backend for **tool-free agents** — those that do pure reasoning with no file or shell access. It runs locally at zero API cost and falls back to the Anthropic API automatically if unreachable.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `USE_OLLAMA_FOR_PLANNER` | `false` | Route Planner to local Ollama |
 | `USE_OLLAMA_FOR_SPEC_REVIEWER` | `false` | Route Spec Reviewer to local Ollama |
 | `OLLAMA_MODEL` | `qwen2.5:14b` | Which Ollama model to use |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server endpoint |
 
 ---
 
@@ -668,7 +705,11 @@ This means githubFixer can safely be restarted mid-workflow — it will pick up 
 
 ## 11. Security Model
 
-Each issue gets an isolated git worktree under `/tmp/issue-solver/`. A generated `.claude/settings.json` is written into each worktree to control what the Coder/Tester/Reviewer agents can do.
+Each issue gets an isolated git worktree under `/tmp/issue-solver/`. Agent tool access is controlled by the backend:
+
+- **Anthropic API backend** — tools are explicitly declared per agent (e.g. Coder gets Read/Write/Edit/Glob/Grep/Bash; Analyzer gets Read/Glob/Grep only). The Bash executor enforces an allowlist before running any shell command.
+- **Codex CLI backend** — uses `--approval-mode full-auto`; tool access is managed natively by the CLI.
+- **Ollama backend** — only used for tool-free agents (Planner, Spec Reviewer); no file or shell access.
 
 ### Bash Command Hook (`security.py`)
 

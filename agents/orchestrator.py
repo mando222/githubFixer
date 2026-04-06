@@ -227,9 +227,8 @@ async def _run_ollama_with_fallback(
     label: str,
     fallback_model: str,
     fallback_repo_path: Path,
-    fallback_settings_file: Path,
 ) -> str:
-    """Try Ollama first; fall back to Claude on OllamaUnavailableError."""
+    """Try Ollama first; fall back to Anthropic API on OllamaUnavailableError."""
     from agents.ollama_client import OllamaUnavailableError, run_ollama_agent
     try:
         return await run_ollama_agent(
@@ -239,14 +238,13 @@ async def _run_ollama_with_fallback(
         )
     except OllamaUnavailableError as exc:
         logger.warning(
-            "[%s] Ollama unavailable (%s) — falling back to Claude", label, exc
+            "[%s] Ollama unavailable (%s) — falling back to Anthropic API", label, exc
         )
     client = _make_agent_client(
         system_prompt=system_prompt,
         model=fallback_model,
         tools=[],
         repo_path=fallback_repo_path,
-        settings_file=fallback_settings_file,
     )
     return await _run_agent(client, task_prompt, label)
 
@@ -506,7 +504,6 @@ class IssueWorkflow:
                 label=f"{self._label} planner",
                 fallback_model=AGENT_MODELS["planner"],
                 fallback_repo_path=self.repo_path,
-                fallback_settings_file=self.settings_file,
             )
         client = _make_agent_client(
             system_prompt=self._planner_prompt,
@@ -535,7 +532,6 @@ class IssueWorkflow:
                 label=f"{self._label} spec-reviewer",
                 fallback_model=AGENT_MODELS["spec-reviewer"],
                 fallback_repo_path=self.repo_path,
-                fallback_settings_file=self.settings_file,
             )
         client = _make_agent_client(
             system_prompt=self._spec_reviewer_prompt,

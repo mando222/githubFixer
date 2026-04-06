@@ -12,9 +12,6 @@ import os
 import re
 import shlex
 
-from claude_agent_sdk import PreToolUseHookInput  # type: ignore[import]
-from claude_agent_sdk.types import HookContext, SyncHookJSONOutput  # type: ignore[import]
-
 
 ALLOWED_BASE_COMMANDS: set[str] = {
     # File inspection
@@ -111,7 +108,7 @@ def _find_segment(cmd: str, command_string: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public validator (used by unit tests and the hook)
+# Public validator (used by tools.py Bash executor and unit tests)
 # ---------------------------------------------------------------------------
 
 def validate_bash_command(command: str) -> tuple[bool, str]:
@@ -132,29 +129,3 @@ def validate_bash_command(command: str) -> tuple[bool, str]:
                 return False, reason
 
     return True, ""
-
-
-# ---------------------------------------------------------------------------
-# Hook — must match the SDK's expected async signature exactly
-# ---------------------------------------------------------------------------
-
-async def bash_security_hook(
-    input_data: PreToolUseHookInput,
-    tool_use_id: str | None = None,
-    context: HookContext | None = None,
-) -> SyncHookJSONOutput:
-    """PreToolUse hook: validate Bash commands against the allowlist."""
-    if input_data.get("tool_name") != "Bash":
-        return {}
-
-    command: str = input_data.get("tool_input", {}).get("command", "")
-    if not command:
-        return {}
-
-    allowed, reason = validate_bash_command(command)
-    if not allowed:
-        return SyncHookJSONOutput(
-            decision="block",
-            reason=f"Security policy blocked: {reason}. Command: {command!r}",
-        )
-    return {}

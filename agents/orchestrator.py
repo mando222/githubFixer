@@ -7,45 +7,21 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
-from agents.definitions import AGENT_MODELS
+from agents.anthropic_client import AnthropicAPIClient, AnthropicAPIClientOptions
+from agents.codex_client import CodexClient, CodexClientOptions
+from agents.definitions import AGENT_MODELS, CODEX_AGENT_MODELS
+from agents.types import AssistantMessage, ResultMessage, RateLimitEvent, TextBlock
 from config import settings
 from linear_client import LinearState, LinearTask, get_linear_client
 from prompts import load_prompt
-from security import bash_security_hook
 from workspace import issue_workspace
 
 if TYPE_CHECKING:
     from models import IssueEvent
 
-try:
-    from claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
-        ResultMessage, RateLimitEvent,
-    )
-    from claude_agent_sdk.types import (  # type: ignore[import]
-        HookCallback, HookMatcher, TextBlock,
-    )
-except ImportError:
-    from anthropic.claude_agent_sdk import (  # type: ignore[import]
-        AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient,
-        ResultMessage, RateLimitEvent,
-    )
-    from anthropic.claude_agent_sdk.types import (  # type: ignore[import]
-        HookCallback, HookMatcher, TextBlock,
-    )
-
 logger = logging.getLogger(__name__)
-
-_BASH_HOOKS = {
-    "PreToolUse": [
-        HookMatcher(
-            matcher="Bash",
-            hooks=[cast(HookCallback, bash_security_hook)],
-        )
-    ]
-}
 
 class AgentStreamError(RuntimeError):
     """Raised when an agent's response stream closes unexpectedly."""
@@ -138,24 +114,38 @@ def _make_agent_client(
     model: str,
     tools: list[str],
     repo_path: Path,
-    settings_file: Path,
-    mcp_servers: dict | None = None,
-    hooks: dict | None = None,
-) -> ClaudeSDKClient:
-    return ClaudeSDKClient(
-        options=ClaudeAgentOptions(
+    agent_type: str = "",
+) -> AnthropicAPIClient | CodexClient:
+    # Resolve effective backend: per-agent override takes precedence over global default.
+    per_agent_attr = f"{agent_type.replace('-', '_')}_agent_backend" if agent_type else ""
+    per_agent_backend = getattr(settings, per_agent_attr, "") if per_agent_attr else ""
+    backend = per_agent_backend or settings.agent_backend
+
+    if backend == "codex":
+        codex_model = CODEX_AGENT_MODELS.get(agent_type, settings.codex_coder_model)
+        return CodexClient(
+            options=CodexClientOptions(
+                system_prompt=system_prompt,
+                model=codex_model,
+                cwd=str(repo_path),
+                timeout=float(settings.codex_timeout_seconds),
+            )
+        )
+
+    # Default: Anthropic API
+    return AnthropicAPIClient(
+        options=AnthropicAPIClientOptions(
             system_prompt=system_prompt,
             model=model,
             tools=tools,
             cwd=str(repo_path),
-            settings=str(settings_file.resolve()),
-            mcp_servers=mcp_servers or {},
-            hooks=hooks or {},
+            max_tokens=settings.max_tokens_per_agent,
+            api_key=settings.anthropic_api_key or None,
         )
     )
 
 
-async def _run_agent(client: ClaudeSDKClient, task_prompt: str, label: str = "") -> str:
+async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str, label: str = "") -> str:
     """Run a single agent session and return the full text response."""
     collected: list[str] = []
     tool_call_count = 0
@@ -222,6 +212,12 @@ async def _run_agent(client: ClaudeSDKClient, task_prompt: str, label: str = "")
             "[%s] DONE in %.1fs (%d tool calls, %d text blocks)",
             issue_ref, elapsed, tool_call_count, len(collected),
         )
+        # Log token usage if the client exposes it (AnthropicAPIClient sets last_usage)
+        usage = getattr(client, "last_usage", None)
+        if usage and label:
+            inp = getattr(usage, "input_tokens", 0)
+            out = getattr(usage, "output_tokens", 0)
+            alog.info("[%s] TOKENS: %d in / %d out", issue_ref, inp, out)
     return "\n".join(collected)
 
 
@@ -367,29 +363,6 @@ def _parse_reviewer_output(text: str) -> ReviewResult:
 
 
 # --------------------------------------------------------------------------- #
-# Security settings                                                            #
-# --------------------------------------------------------------------------- #
-
-def _write_security_settings(workspace_dir: Path) -> Path:
-    security_settings = {
-        "permissions": {
-            "defaultMode": "acceptEdits",
-            "allow": [
-                "Read(./**)",
-                "Write(./**)",
-                "Edit(./**)",
-                "Glob(./**)",
-                "Grep(./**)",
-                "Bash(*)",
-            ],
-        },
-    }
-    settings_file = workspace_dir / ".claude_settings.json"
-    settings_file.write_text(json.dumps(security_settings, indent=2))
-    return settings_file
-
-
-# --------------------------------------------------------------------------- #
 # IssueWorkflow                                                                #
 # --------------------------------------------------------------------------- #
 
@@ -404,7 +377,6 @@ class IssueWorkflow:
         self.event = event
         self.workspace_dir = workspace_dir
         self.repo_path = workspace_dir / "repo"
-        self.settings_file = workspace_dir / ".claude_settings.json"
         self._label = f"{event.repo_full_name}#{event.number}"
 
         # Workflow state
@@ -462,7 +434,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["codebase-analyzer"],
             tools=["Read", "Glob", "Grep"],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
+            agent_type="codebase-analyzer",
         )
         return await _run_agent(client, task, f"{self._label} analyzer")
 
@@ -472,8 +444,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["coder"],
             tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
-            hooks=_BASH_HOOKS,
+            agent_type="coder",
         )
         return await _run_agent(client, task, f"{self._label} coder")
 
@@ -483,8 +454,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["tester"],
             tools=["Bash", "Read"],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
-            hooks=_BASH_HOOKS,
+            agent_type="tester",
         )
         return await _run_agent(client, task, f"{self._label} tester")
 
@@ -494,8 +464,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["reviewer"],
             tools=["Bash", "Read", "Glob", "Grep"],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
-            hooks=_BASH_HOOKS,
+            agent_type="reviewer",
         )
         return await _run_agent(client, task, f"{self._label} reviewer")
 
@@ -505,7 +474,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["planner"],
             tools=[],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
+            agent_type="planner",
         )
         return await _run_agent(client, task, f"{self._label} planner")
 
@@ -515,7 +484,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["spec-writer"],
             tools=[],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
+            agent_type="spec-writer",
         )
         return await _run_agent(client, task, f"{self._label} spec-writer")
 
@@ -525,7 +494,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["spec-reviewer"],
             tools=[],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
+            agent_type="spec-reviewer",
         )
         return await _run_agent(client, task, f"{self._label} spec-reviewer")
 
@@ -535,8 +504,7 @@ class IssueWorkflow:
             model=AGENT_MODELS["github-submitter"],
             tools=["Bash", "Read"],
             repo_path=self.repo_path,
-            settings_file=self.settings_file,
-            hooks=_BASH_HOOKS,
+            agent_type="github-submitter",
         )
         return await _run_agent(client, task, f"{self._label} submitter")
 
@@ -1637,7 +1605,6 @@ async def run_issue_full(
         event.repo_full_name, event.number, event.title,
     )
     async with issue_workspace(event.repo_name, event.number, event.clone_url) as workspace_dir:
-        _write_security_settings(workspace_dir)
         workflow = IssueWorkflow(event, workspace_dir)
 
         # Planning: throttled to prevent API rate-limit pile-up on large batches
@@ -1670,7 +1637,6 @@ async def run_issue_planning(event: "IssueEvent") -> None:
         event.repo_full_name, event.number, event.title,
     )
     async with issue_workspace(event.repo_name, event.number, event.clone_url) as workspace_dir:
-        _write_security_settings(workspace_dir)
         workflow = IssueWorkflow(event, workspace_dir)
         await workflow.plan()
     logger.info("Planning complete for %s#%d", event.repo_full_name, event.number)
@@ -1683,7 +1649,6 @@ async def run_issue_execution(event: "IssueEvent") -> None:
         event.repo_full_name, event.number, event.title,
     )
     async with issue_workspace(event.repo_name, event.number, event.clone_url) as workspace_dir:
-        _write_security_settings(workspace_dir)
         workflow = IssueWorkflow(event, workspace_dir)
         await workflow.execute()
     logger.info("Execution complete for %s#%d", event.repo_full_name, event.number)
@@ -1696,7 +1661,6 @@ async def run_issue_workflow(event: "IssueEvent") -> None:
         event.repo_full_name, event.number, event.title,
     )
     async with issue_workspace(event.repo_name, event.number, event.clone_url) as workspace_dir:
-        _write_security_settings(workspace_dir)
         workflow = IssueWorkflow(event, workspace_dir)
         await workflow.run()
     logger.info("Workflow complete for %s#%d", event.repo_full_name, event.number)

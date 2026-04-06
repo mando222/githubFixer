@@ -50,6 +50,43 @@ class Settings(BaseSettings):
     # Max fix tasks spawned per review cycle (prevents coder explosion when reviewer lists many issues)
     max_fix_tasks_per_review_cycle: int = 3
 
+    # ── Anthropic API ─────────────────────────────────────────────────────
+    # API key for direct Anthropic API access (the default backend).
+    # Falls back to the ANTHROPIC_API_KEY environment variable if empty.
+    anthropic_api_key: str = ""
+
+    # Max output tokens per individual agent API call.
+    max_tokens_per_agent: int = 16384
+
+    # ── Agent backend ──────────────────────────────────────────────────────
+    # "anthropic" — direct Anthropic API (default, no CLI required)
+    # "codex"     — OpenAI Codex CLI (requires: npm install -g @openai/codex)
+    agent_backend: str = "anthropic"  # "anthropic" | "codex"
+
+    # Per-agent backend overrides (empty string → use agent_backend above).
+    # Example .env entry:  CODER_AGENT_BACKEND=codex
+    analyzer_agent_backend: str = ""
+    coder_agent_backend: str = ""
+    tester_agent_backend: str = ""
+    reviewer_agent_backend: str = ""
+    github_agent_backend: str = ""
+    planner_agent_backend: str = ""
+    spec_writer_agent_backend: str = ""
+    spec_reviewer_agent_backend: str = ""
+
+    # Codex model names — one per agent type.
+    # OpenAI model IDs: o4-mini, o3, gpt-4.1, etc.
+    codex_analyzer_model: str = "o4-mini"
+    codex_coder_model: str = "o4-mini"
+    codex_tester_model: str = "o4-mini"
+    codex_reviewer_model: str = "o4-mini"
+    codex_github_model: str = "o4-mini"
+    codex_planner_model: str = "o4-mini"
+    codex_spec_writer_model: str = "o4-mini"
+    codex_spec_reviewer_model: str = "o4-mini"
+
+    # Per-call subprocess timeout for Codex agents (Codex is slower than SDK streaming).
+    codex_timeout_seconds: int = 600  # 10 minutes
 
 
 @lru_cache

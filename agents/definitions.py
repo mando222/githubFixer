@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import dataclass, field
 
 from config import settings
 from prompts import load_prompt
 
-# claude_agent_sdk import — adjust if the package name differs on install
-try:
-    from claude_agent_sdk import AgentDefinition  # type: ignore[import]
-except ImportError:
-    from anthropic.types.beta import AgentDefinition  # type: ignore[import]
 
-ModelShortname = Literal["sonnet", "opus", "haiku", "inherit"]
+@dataclass
+class AgentDefinition:
+    """Declarative spec for a sub-agent invocation."""
+    description: str
+    prompt: str
+    tools: list[str]
+    model: str  # Full Anthropic model ID, e.g. "claude-sonnet-4-6"
+
 
 # Full model IDs for direct (non-subagent) invocation
 AGENT_MODELS: dict[str, str] = {
@@ -25,17 +27,17 @@ AGENT_MODELS: dict[str, str] = {
     "spec-reviewer": settings.spec_reviewer_agent_model,
 }
 
-
-def _shortname(model: str) -> ModelShortname:
-    """Map a full Claude model string to the AgentDefinition shortname literal."""
-    m = model.lower()
-    if "haiku" in m:
-        return "haiku"
-    if "sonnet" in m:
-        return "sonnet"
-    if "opus" in m:
-        return "opus"
-    return "inherit"
+# Codex model IDs for each agent type (used when agent_backend = "codex").
+CODEX_AGENT_MODELS: dict[str, str] = {
+    "codebase-analyzer": settings.codex_analyzer_model,
+    "coder": settings.codex_coder_model,
+    "tester": settings.codex_tester_model,
+    "reviewer": settings.codex_reviewer_model,
+    "github-submitter": settings.codex_github_model,
+    "planner": settings.codex_planner_model,
+    "spec-writer": settings.codex_spec_writer_model,
+    "spec-reviewer": settings.codex_spec_reviewer_model,
+}
 
 
 def make_codebase_analyzer() -> AgentDefinition:
@@ -47,7 +49,7 @@ def make_codebase_analyzer() -> AgentDefinition:
         ),
         prompt=load_prompt("codebase_analyzer"),
         tools=["Read", "Glob", "Grep"],
-        model=_shortname(settings.analyzer_agent_model),
+        model=settings.analyzer_agent_model,
     )
 
 
@@ -60,7 +62,7 @@ def make_coder() -> AgentDefinition:
         ),
         prompt=load_prompt("coder"),
         tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-        model=_shortname(settings.coding_agent_model),
+        model=settings.coding_agent_model,
     )
 
 
@@ -72,9 +74,8 @@ def make_github_submitter() -> AgentDefinition:
         ),
         prompt=load_prompt("github_submitter"),
         tools=["Bash", "Read"],
-        model=_shortname(settings.github_agent_model),
+        model=settings.github_agent_model,
     )
-
 
 
 def make_tester() -> AgentDefinition:
@@ -85,7 +86,7 @@ def make_tester() -> AgentDefinition:
         ),
         prompt=load_prompt("tester"),
         tools=["Bash", "Read"],
-        model=_shortname(settings.tester_agent_model),
+        model=settings.tester_agent_model,
     )
 
 
@@ -98,7 +99,7 @@ def make_reviewer() -> AgentDefinition:
         ),
         prompt=load_prompt("reviewer"),
         tools=["Bash", "Read", "Glob", "Grep"],
-        model=_shortname(settings.reviewer_agent_model),
+        model=settings.reviewer_agent_model,
     )
 
 
@@ -112,7 +113,7 @@ def make_planner() -> AgentDefinition:
         ),
         prompt=load_prompt("planner"),
         tools=[],
-        model=_shortname(settings.planner_agent_model),
+        model=settings.planner_agent_model,
     )
 
 
@@ -127,7 +128,7 @@ def make_spec_writer() -> AgentDefinition:
         ),
         prompt=load_prompt("spec_writer"),
         tools=[],
-        model=_shortname(settings.spec_writer_agent_model),
+        model=settings.spec_writer_agent_model,
     )
 
 
@@ -141,5 +142,5 @@ def make_spec_reviewer() -> AgentDefinition:
         ),
         prompt=load_prompt("spec_reviewer"),
         tools=[],
-        model=_shortname(settings.spec_reviewer_agent_model),
+        model=settings.spec_reviewer_agent_model,
     )

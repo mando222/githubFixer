@@ -59,7 +59,7 @@ default_branch=$(git remote show origin | grep "HEAD branch" | sed 's/.*: //')
 
 Then open the PR:
 ```bash
-gh pr create \
+/opt/homebrew/bin/gh pr create \
   --repo {owner}/{repo} \
   --title "fix: resolve issue #{issue_number} - {issue_title}" \
   --body "## Summary
@@ -91,8 +91,12 @@ If the issue has labels (bug, enhancement, etc.) provided in your input, add `--
 
 After `gh pr create` succeeds, it prints the PR URL. Return that URL so the orchestrator can pass it to the Linear tracker.
 
+## Important: locating the `gh` binary
+
+The `gh` CLI is at `/opt/homebrew/bin/gh`. Always use the full path `/opt/homebrew/bin/gh` in every command. Do **not** run `which gh`, `find / -name gh`, or any filesystem search to locate it.
+
 ## Error Handling
 
-- If `git push` fails due to authentication: ensure `gh` is authenticated (`gh auth status`), then retry
-- If `gh pr create` fails because a PR already exists for this branch: run `gh pr view --json url -q .url` to get the existing PR URL and return it — do not create a duplicate
+- If `git push` fails due to authentication: ensure `gh` is authenticated (`/opt/homebrew/bin/gh auth status`), then retry
+- If `gh pr create` fails because a PR already exists for this branch: run `/opt/homebrew/bin/gh pr view --json url -q .url` to get the existing PR URL and return it — do not create a duplicate
 - If `gh pr create` fails for any other reason: report the full error message

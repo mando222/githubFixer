@@ -111,6 +111,34 @@ def _find_segment(cmd: str, command_string: str) -> str:
 # Public validator (used by tools.py Bash executor and unit tests)
 # ---------------------------------------------------------------------------
 
+_BLOCKED_FIND_ROOTS: tuple[str, ...] = ("/", "/Volumes", "/Network", "/home")
+
+
+def _check_find_path(command: str) -> tuple[bool, str]:
+    """Block find commands that search from filesystem roots (e.g. find / -name gh)."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True, ""
+    # Collect all 'find' invocations and their first positional argument (the path)
+    i = 0
+    while i < len(tokens):
+        if os.path.basename(tokens[i]) in ("find",):
+            # Next non-flag token is the search path
+            j = i + 1
+            while j < len(tokens) and tokens[j].startswith("-"):
+                j += 1
+            if j < len(tokens):
+                search_path = tokens[j].rstrip("/") or "/"
+                if search_path in _BLOCKED_FIND_ROOTS:
+                    return False, (
+                        f"find with root path '{search_path}' is not allowed — "
+                        "search within the repo directory instead"
+                    )
+        i += 1
+    return True, ""
+
+
 def validate_bash_command(command: str) -> tuple[bool, str]:
     """
     Returns (allowed, reason).  reason is empty when allowed.
@@ -125,6 +153,11 @@ def validate_bash_command(command: str) -> tuple[bool, str]:
         if cmd == "git":
             seg = _find_segment("git", command)
             ok, reason = _validate_git_subcommand(seg)
+            if not ok:
+                return False, reason
+        if cmd == "find":
+            seg = _find_segment("find", command)
+            ok, reason = _check_find_path(seg)
             if not ok:
                 return False, reason
 

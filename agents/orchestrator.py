@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -250,7 +251,7 @@ async def _run_ollama_with_fallback(
     return await _run_agent(client, task_prompt, label)
 
 
-_GH_BIN: str = shutil.which("gh") or "gh"
+_GH_BIN: str = shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin") or "gh"
 
 
 async def _gh_subprocess(args: list[str], cwd: Path, timeout: float = 30.0) -> str:

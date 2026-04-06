@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -52,11 +53,14 @@ logger = logging.getLogger(__name__)
 # gh CLI helpers (works for both public and private repos)                     #
 # --------------------------------------------------------------------------- #
 
+_EXTENDED_PATH = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
+_GH_BIN: str = shutil.which("gh", path=_EXTENDED_PATH) or "gh"
+
+
 def _gh(args: list[str]) -> list | dict:
     """Run a gh CLI command with --json and return parsed output."""
-    gh = shutil.which("gh") or "gh"
     result = subprocess.run(
-        [gh] + args,
+        [_GH_BIN] + args,
         capture_output=True,
         text=True,
     )

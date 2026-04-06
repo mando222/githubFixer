@@ -1,8 +1,8 @@
 """
-Local message type dataclasses — replaces claude_agent_sdk message types.
+Local message type dataclasses shared by AnthropicAPIClient and CodexClient.
 
-These are used by both AnthropicAPIClient and CodexClient so that the
-isinstance() checks in _run_agent() work without any changes to that function.
+Using a common type hierarchy ensures isinstance() checks in _run_agent()
+work identically regardless of which backend is active.
 """
 from __future__ import annotations
 

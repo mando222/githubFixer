@@ -1,10 +1,10 @@
 """
 CodexClient — subprocess adapter for the OpenAI Codex CLI.
 
-Implements the same async context-manager + streaming interface as ClaudeSDKClient
+Implements the same async context-manager + streaming interface as AnthropicAPIClient
 so that _run_agent() in orchestrator.py works without modification.
 
-Usage (mirrors ClaudeSDKClient):
+Usage:
     async with CodexClient(options) as client:
         await client.query(task_prompt)
         async for message in client.receive_response():
@@ -30,7 +30,7 @@ class CodexClientOptions:
 class CodexClient:
     """Async subprocess wrapper around the Codex CLI.
 
-    Compatible with the ClaudeSDKClient interface used in orchestrator._run_agent():
+    Implements the agent client interface used in orchestrator._run_agent():
       - async context manager (__aenter__ / __aexit__)
       - query(prompt)        — stores the task prompt
       - receive_response()   — async generator yielding AssistantMessage / ResultMessage

@@ -1,10 +1,10 @@
 """
 AnthropicAPIClient — direct Anthropic API backend with a full agentic loop.
 
-Implements the same async context-manager + streaming interface as ClaudeSDKClient
-so that _run_agent() in orchestrator.py works without modification.
+Implements the async context-manager + streaming interface expected by
+_run_agent() in orchestrator.py.
 
-Usage (mirrors ClaudeSDKClient):
+Usage:
     async with AnthropicAPIClient(options) as client:
         await client.query(task_prompt)
         async for message in client.receive_response():
@@ -48,7 +48,7 @@ class AnthropicAPIClientOptions:
 class AnthropicAPIClient:
     """Direct Anthropic API client with a self-contained agentic tool loop.
 
-    Compatible with the ClaudeSDKClient interface used in orchestrator._run_agent():
+    Implements the agent client interface used in orchestrator._run_agent():
       - async context manager (__aenter__ / __aexit__)
       - query(prompt)        — stores the task prompt
       - receive_response()   — async generator running the agentic loop,

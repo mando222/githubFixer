@@ -5,7 +5,7 @@ Automatically resolves GitHub issues using a multi-agent Claude pipeline. Point 
 ## Prerequisites
 
 - Python 3.11+
-- [Claude Code CLI](https://claude.ai/code) installed and authenticated
+- An [Anthropic API key](https://console.anthropic.com/) set as `ANTHROPIC_API_KEY` in your `.env`
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - A [Linear](https://linear.app) workspace with an API key
 - (Optional) [Ollama](https://ollama.com) for local LLM cost savings — see [Cost Savings with Ollama](#cost-savings-with-ollama)
@@ -26,6 +26,7 @@ Create a `.env` file in the project root:
 # Required
 LINEAR_API_KEY=lin_api_...
 LINEAR_TEAM_ID=your-team-id
+ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional — override default models
 # CODING_AGENT_MODEL=claude-opus-4-6
@@ -41,7 +42,7 @@ LINEAR_TEAM_ID=your-team-id
 # OLLAMA_BASE_URL=http://localhost:11434
 ```
 
-Claude authentication is handled through the Claude Code CLI — no API key needed here. Make sure you're logged in (`claude`) before running.
+Anthropic authentication is configured via `ANTHROPIC_API_KEY` in your `.env` file.
 
 To find your Linear Team ID: go to Linear → Settings → API → scroll to "Team IDs".
 
@@ -95,7 +96,7 @@ The pipeline will run fully autonomously for each issue:
 
 ## Ollama Integration
 
-Two agents — the **task planner** and the **spec reviewer** — do pure text reasoning with no tool use and can optionally run on a local [Ollama](https://ollama.com) instance. All other agents require Claude Code tool use (Read, Write, Edit, Bash, etc.) and must stay on Claude.
+Two agents — the **task planner** and the **spec reviewer** — do pure text reasoning with no tool use and can optionally run on a local [Ollama](https://ollama.com) instance. All other agents require tool use (Read, Write, Edit, Bash, etc.) and must use the Anthropic API backend.
 
 | Agent | Default model | Ollama? |
 |---|---|---|

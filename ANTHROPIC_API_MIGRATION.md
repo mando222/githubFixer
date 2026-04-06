@@ -1,3 +1,5 @@
+> **Archived** — This migration is complete. This document is kept for historical reference only.
+
 # Anthropic API Migration Plan
 
 ## Context

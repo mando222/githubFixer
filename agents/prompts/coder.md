@@ -45,6 +45,31 @@ If you receive test failure details or reviewer issues along with your task, you
 - Place test files alongside existing test files in the project's test directory
 - Match the existing import style (stdlib → third-party → local, or whatever the project uses)
 
+## Critical: Test File Path Handling
+
+**Never hardcode the absolute path to the repository in test files.** The repo is cloned to a temporary directory (e.g. `/tmp/issue-solver/test-42/repo`) that will not exist on any other machine or CI system.
+
+When a test needs to locate the repository root or a sibling script, use a path relative to the test file itself:
+
+```python
+# ✅ Correct — works everywhere
+import os, sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
+# Or with pathlib:
+from pathlib import Path
+_REPO = Path(__file__).parent
+sys.path.insert(0, str(_REPO))
+```
+
+```python
+# ❌ Wrong — breaks outside this machine
+sys.path.insert(0, '/tmp/issue-solver/test-42/repo')
+```
+
+If you see a hardcoded absolute path in an existing test file, fix it as part of your change.
+
 ## Output Format
 
 When finished, report using this exact structure:

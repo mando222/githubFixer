@@ -74,6 +74,7 @@ Or on failure:
 ## Rules
 
 - Do NOT modify any files
+- If tests fail with `ModuleNotFoundError` or a path like `/tmp/issue-solver/...` appears hardcoded in the traceback, report it as a `suggested_fix` of "Fix hardcoded absolute path in test file — use `Path(__file__).parent` instead"
 - Do NOT install missing dependencies (report the error instead)
 - If no tests exist, return `{"status": "PASS", "summary": "No test suite found — no tests to verify against", "command": "", "failures": [], "warning": "No tests exist in this repository"}`
 - If the test command fails to run (e.g., import error, missing dep), set `"status": "FAIL"` and put the error in `failures[0].error` with `"test": "test suite setup"`

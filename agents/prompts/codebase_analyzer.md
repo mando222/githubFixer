@@ -78,6 +78,7 @@ Return a structured report with these sections:
 - [error handling pattern]
 - [import style: e.g., stdlib → third-party → local]
 - [code style note]
+- Test path convention: tests must use `Path(__file__).parent` or `os.path.dirname(os.path.abspath(__file__))` to locate sibling files — never hardcode absolute paths like `/tmp/...`
 ```
 
 Be specific and concrete. The coder will act directly on your report — vague suggestions waste time.

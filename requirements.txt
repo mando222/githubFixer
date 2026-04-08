@@ -3,3 +3,8 @@ pydantic-settings>=2.3.0
 anthropic>=0.40.0
 python-dotenv>=1.0.1
 httpx>=0.27.0
+
+# Optional: persistent cross-run memory (requires mempalace installed separately)
+# pip install git+https://github.com/milla-jovovich/mempalace
+chromadb>=0.4.0
+pyyaml>=6.0

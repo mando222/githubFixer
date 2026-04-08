@@ -17,6 +17,7 @@ from agents.definitions import AGENT_MODELS, CODEX_AGENT_MODELS
 from agents.types import AssistantMessage, ResultMessage, RateLimitEvent, TextBlock
 from config import settings
 from linear_client import LinearState, LinearTask, get_linear_client
+from mempalace_client import MemPalaceClient, get_head_commit_hash
 from prompts import load_prompt
 from workspace import issue_workspace
 
@@ -421,6 +422,13 @@ class IssueWorkflow:
         self.pr_url: str | None = None
         self.modified_files: list[str] = []
         self._review_issue_hashes: set[int] = set()  # hashes from prior review cycles for circuit breaker
+        self._last_test_failures: list[dict] = []  # stored for mempalace failure recording
+
+        # Optional persistent memory (no-op when MEMPALACE_ENABLED=false)
+        self._memory: MemPalaceClient | None = (
+            MemPalaceClient(settings.mempalace_palace_path)
+            if settings.mempalace_enabled else None
+        )
 
         # Direct Linear API client (replaces linear-tracker LLM agent)
         self._linear = get_linear_client()
@@ -470,6 +478,30 @@ class IssueWorkflow:
             agent_type="codebase-analyzer",
         )
         return await _run_agent(client, task, f"{self._label} analyzer")
+
+    async def _run_codebase_analyzer_cached(self) -> str:
+        """Run codebase analysis, returning a mempalace-cached result when available."""
+        if self._memory and self._memory.is_available():
+            repo_slug = self.event.repo_full_name.replace("/", "-")
+            commit_hash = get_head_commit_hash(self.repo_path)
+            if commit_hash:
+                cached = self._memory.get_cached_analysis(repo_slug, commit_hash)
+                if cached:
+                    logger.info(
+                        "[%s] Phase 2: Using cached codebase analysis from mempalace (%s)",
+                        self._label, commit_hash,
+                    )
+                    return cached
+
+        analysis = await self._run_codebase_analyzer(self._prompt_analyze_codebase())
+
+        if self._memory and self._memory.is_available():
+            repo_slug = self.event.repo_full_name.replace("/", "-")
+            commit_hash = get_head_commit_hash(self.repo_path)
+            if commit_hash:
+                self._memory.cache_analysis(repo_slug, commit_hash, analysis)
+
+        return analysis
 
     async def _run_coder(self, task: str) -> str:
         client = _make_agent_client(
@@ -633,7 +665,7 @@ class IssueWorkflow:
         if need_linear:
             logger.info("[%s] Phase 1+2: Creating Linear issue + analyzing codebase in parallel", self._label)
             analysis_task = asyncio.create_task(
-                self._run_codebase_analyzer(self._prompt_analyze_codebase())
+                self._run_codebase_analyzer_cached()
             )
             async with _linear_project_lock(self.event.repo_full_name):
                 self.linear_issue_id, self.linear_project_id = await self._linear.create_issue(
@@ -647,7 +679,7 @@ class IssueWorkflow:
             logger.info("[%s] Phase 2: Analyzing codebase (attempting spec recovery)", self._label)
             spec_result, self.analysis = await asyncio.gather(
                 self._fetch_spec_from_linear(),
-                self._run_codebase_analyzer(self._prompt_analyze_codebase()),
+                self._run_codebase_analyzer_cached(),
             )
             self.spec = spec_result or ""
 
@@ -890,6 +922,16 @@ class IssueWorkflow:
                 f"{formatted}"
             )
 
+        memory_section = ""
+        if self._memory and self._memory.is_available():
+            repo_slug = self.event.repo_full_name.replace("/", "-")
+            prior = self._memory.get_prior_decisions(repo_slug)
+            if prior:
+                memory_section = (
+                    f"\n\nPrior decisions & implementations in this repo "
+                    f"(from memory — use as context, not constraints):\n{prior}"
+                )
+
         prompt = (
             f"Write a complete project spec for this GitHub issue.\n\n"
             f"Issue title: {self.event.title}\n"
@@ -897,6 +939,7 @@ class IssueWorkflow:
             f"Issue body:\n{self.event.body or '(no body)'}\n\n"
             f"Codebase Analysis:\n{self.analysis}"
             f"{comments_section}"
+            f"{memory_section}"
         )
 
         result = await self._run_spec_writer(prompt)
@@ -1096,6 +1139,7 @@ class IssueWorkflow:
         # Tests failed — create remediation tasks
         logger.info("[%s] Phase 5.5: %d failure(s): %s", self._label, len(result.failures), result.summary)
         self._linear_bg(f"🔧 Test failures (cycle {cycle + 1}/2): {result.summary}")
+        self._last_test_failures = result.failures  # stored for mempalace failure recording
 
         fix_tasks = [
             Task(
@@ -1275,6 +1319,16 @@ class IssueWorkflow:
                 self.pr_url = _extract_pr_url(result)
                 if self.pr_url:
                     logger.info("[%s] PR URL: %s", self._label, self.pr_url)
+                    if self._memory and self._memory.is_available():
+                        repo_slug = self.event.repo_full_name.replace("/", "-")
+                        self._memory.record_pr(
+                            repo_slug=repo_slug,
+                            issue_number=self.event.number,
+                            issue_title=self.event.title,
+                            spec=self.spec,
+                            modified_files=self.modified_files,
+                            pr_url=self.pr_url,
+                        )
                     break
                 logger.warning(
                     "[%s] No PR URL in submitter output (attempt %d/2)", self._label, attempt,
@@ -1324,6 +1378,14 @@ class IssueWorkflow:
             f"**Reason:** {reason}"
         )
         await self._post_github_comment(gh_body)
+        if self._memory and self._memory.is_available():
+            repo_slug = self.event.repo_full_name.replace("/", "-")
+            self._memory.record_failure(
+                repo_slug=repo_slug,
+                issue_number=self.event.number,
+                reason=reason,
+                failures=self._last_test_failures,
+            )
         if not self.linear_issue_id:
             return
         try:
@@ -1359,12 +1421,22 @@ class IssueWorkflow:
 
     def _prompt_coder_task(self, task: Task) -> str:
         spec_section = f"\nProject Spec:\n{self.spec}\n" if self.spec else ""
+        memory_section = ""
+        if self._memory and self._memory.is_available():
+            repo_slug = self.event.repo_full_name.replace("/", "-")
+            prior = self._memory.get_prior_decisions(repo_slug)
+            if prior:
+                memory_section = (
+                    f"\nPrior implementations in this repo "
+                    f"(context only — do not blindly replicate):\n{prior}\n"
+                )
         return (
             f"Implement this specific task for GitHub issue #{self.event.number}.\n\n"
             f"Issue title: {self.event.title}\n"
             f"Issue body: {self.event.body or '(no body)'}\n"
             f"{spec_section}\n"
             f"Codebase Analysis:\n{self.analysis}\n\n"
+            f"{memory_section}"
             f"Task title: {task.title}\n"
             f"Task description: {task.description}\n"
             f"Files hint: {', '.join(task.files_hint) or 'see analysis'}\n"

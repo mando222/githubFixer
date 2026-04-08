@@ -4,11 +4,12 @@ Automatically resolves GitHub issues using a multi-agent Claude pipeline. Point 
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.9+
 - An [Anthropic API key](https://console.anthropic.com/) set as `ANTHROPIC_API_KEY` in your `.env`
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated (`gh auth login`)
 - A [Linear](https://linear.app) workspace with an API key
 - (Optional) [Ollama](https://ollama.com) for local LLM cost savings — see [Cost Savings with Ollama](#cost-savings-with-ollama)
+- (Optional) [mempalace](https://github.com/milla-jovovich/mempalace) for persistent cross-run memory — see [Persistent Memory with mempalace](#persistent-memory-with-mempalace)
 
 ## Installation
 
@@ -134,3 +135,49 @@ OLLAMA_MODEL=qwen2.5:14b
 If Ollama isn't running, the system falls back to Claude automatically within 5 seconds — no workflow interruption.
 
 > **Context length:** The planner receives 3–6K tokens of input. If you hit issues, set `OLLAMA_NUM_CTX=8192` via an Ollama [Modelfile](https://github.com/ollama/ollama/blob/main/docs/modelfile.md).
+
+## Persistent Memory with mempalace
+
+githubFixer can optionally use [mempalace](https://github.com/milla-jovovich/mempalace) to retain knowledge across runs — so agents remember past architectural decisions, avoid repeating failures, and skip redundant codebase analysis on unchanged commits.
+
+| Without memory | With memory |
+|---|---|
+| Phase 1 re-analyzes the full codebase on every run | Analysis cached by commit hash — instant on repeat runs |
+| Spec writer has no context of prior implementations | Prior decisions injected into each spec and coder prompt |
+| Blocked issues leave no trace for future runs | Failure patterns recorded for learning |
+
+### Setup (one-time)
+
+```bash
+# 1. Install mempalace
+pip install git+https://github.com/milla-jovovich/mempalace
+
+# 2. Create the palace directory
+python3 -c "from mempalace.config import MempalaceConfig; MempalaceConfig().init()"
+# Creates ~/.mempalace/config.json and ~/.mempalace/palace/
+```
+
+Add to your `.env`:
+
+```env
+MEMPALACE_ENABLED=true
+MEMPALACE_PALACE_PATH=~/.mempalace/palace   # default, can omit
+```
+
+### What gets stored
+
+| Event | Room | Content |
+|---|---|---|
+| Phase 2 (analyze) completes | `analysis-cache` | Full analysis, keyed by commit hash |
+| Phase 6 (PR submitted) | `implementations` | Issue title, spec excerpt, modified files, PR URL |
+| Issue blocked | `failure-patterns` | Block reason, failing test names and errors |
+
+Each repo gets its own **wing** (e.g. `owner-repo`), so memory is always scoped per project.
+
+### Cache invalidation
+
+Analysis cache is keyed on `(repo_slug, git-commit-hash)`. A new commit automatically busts the cache — fresh analysis runs and the result is stored. No manual cache clearing needed.
+
+### Disabling
+
+Set `MEMPALACE_ENABLED=false` (the default) to disable completely. The feature flag is read at startup — no restart required between toggles. All mempalace imports are lazy and guarded, so the system runs identically with or without mempalace installed.

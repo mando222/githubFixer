@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     ollama_for_planner: bool = False        # env: USE_OLLAMA_FOR_PLANNER=true
     ollama_for_spec_reviewer: bool = False  # env: USE_OLLAMA_FOR_SPEC_REVIEWER=true
 
+    # mempalace — optional persistent cross-run memory
+    # Requires: pip install git+https://github.com/milla-jovovich/mempalace
+    # Then run: mempalace init ~/.mempalace
+    mempalace_enabled: bool = False
+    mempalace_palace_path: str = "~/.mempalace/palace"
+
 
 @lru_cache
 def get_settings() -> Settings:

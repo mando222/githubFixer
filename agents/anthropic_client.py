@@ -61,6 +61,11 @@ class AnthropicAPIClient:
         self._options = options
         self._task_prompt: str | None = None
         self.last_usage: anthropic.types.Usage | None = None
+        # Cumulative token counts across all turns in this session.
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
+        self.total_cache_creation_tokens: int = 0
+        self.total_cache_read_tokens: int = 0
 
     # ── Async context manager ──────────────────────────────────────────────
 
@@ -118,6 +123,10 @@ class AnthropicAPIClient:
 
             response = await client.messages.create(**kwargs)
             self.last_usage = response.usage
+            self.total_input_tokens += response.usage.input_tokens
+            self.total_output_tokens += response.usage.output_tokens
+            self.total_cache_creation_tokens += getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            self.total_cache_read_tokens += getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
             # Build typed content blocks for the yielded AssistantMessage
             content_blocks: list[TextBlock | ToolUseBlock] = []

@@ -18,6 +18,7 @@ from agents.anthropic_client import AnthropicAPIClient, AnthropicAPIClientOption
 from agents.codex_client import CodexClient, CodexClientOptions
 from agents.definitions import AGENT_MODELS, CODEX_AGENT_MODELS
 from agents.rate_limit_coordinator import signal_rate_limit, wait_for_api
+from token_tracker import record_usage
 from agents.types import AssistantMessage, ResultMessage, RateLimitEvent, TextBlock
 from config import settings
 from linear_client import LinearState, LinearTask, get_linear_client
@@ -236,22 +237,26 @@ async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str,
             final_output = collected
             break
 
-        except anthropic.RateLimitError as exc:
+        except (anthropic.RateLimitError, anthropic.InternalServerError) as exc:
+            is_rate_limit = isinstance(exc, anthropic.RateLimitError)
             elapsed = time.monotonic() - start
-            delay = _extract_retry_after(exc)
+            delay = _extract_retry_after(exc) if is_rate_limit else None
             if delay is None:
+                # Use a shorter cap for transient server overload (529) vs TPM rate limits.
+                max_backoff = settings.rate_limit_max_backoff_seconds if is_rate_limit else 30.0
                 delay = min(
                     settings.rate_limit_base_backoff_seconds * (2 ** attempt),
-                    settings.rate_limit_max_backoff_seconds,
+                    max_backoff,
                 ) + random.uniform(0, 1.0)  # jitter prevents synchronized retries
+            error_label = "Rate limited" if is_rate_limit else "Server overloaded (5xx)"
             alog.warning(
-                "[%s] Rate limited after %.1fs (attempt %d/%d) — pausing %.1fs before retry",
-                issue_ref, elapsed, attempt + 1, settings.rate_limit_max_retries, delay,
+                "[%s] %s after %.1fs (attempt %d/%d) — pausing %.1fs before retry",
+                issue_ref, error_label, elapsed, attempt + 1, settings.rate_limit_max_retries, delay,
             )
             await signal_rate_limit(delay)
             if attempt >= settings.rate_limit_max_retries:
                 raise AgentStreamError(
-                    f"Agent {label!r} hit rate limit {settings.rate_limit_max_retries + 1} times"
+                    f"Agent {label!r} {error_label.lower()} {settings.rate_limit_max_retries + 1} times"
                 ) from exc
             continue
 
@@ -276,12 +281,21 @@ async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str,
             "[%s] DONE in %.1fs (%d tool calls, %d text blocks)",
             issue_ref, elapsed, tool_call_count, len(final_output),
         )
-        # Log token usage if the client exposes it (AnthropicAPIClient sets last_usage)
-        usage = getattr(client, "last_usage", None)
-        if usage and label:
-            inp = getattr(usage, "input_tokens", 0)
-            out = getattr(usage, "output_tokens", 0)
-            alog.info("[%s] TOKENS: %d in / %d out", issue_ref, inp, out)
+        # Log cumulative token usage across all turns (AnthropicAPIClient tracks these).
+        total_in = getattr(client, "total_input_tokens", 0)
+        total_out = getattr(client, "total_output_tokens", 0)
+        if total_in or total_out:
+            alog.info("[%s] TOKENS: %d in / %d out", issue_ref, total_in, total_out)
+            record_usage(
+                issue_ref=issue_ref,
+                usage={
+                    "input_tokens": total_in,
+                    "output_tokens": total_out,
+                    "cache_creation_input_tokens": getattr(client, "total_cache_creation_tokens", 0),
+                    "cache_read_input_tokens": getattr(client, "total_cache_read_tokens", 0),
+                },
+                cost_usd=None,
+            )
     return "\n".join(final_output)
 
 

@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     # Max fix tasks spawned per review cycle (prevents coder explosion when reviewer lists many issues)
     max_fix_tasks_per_review_cycle: int = 3
 
+    # ── Rate limit resilience ─────────────────────────────────────────────────
+    # Max times _run_agent will retry a full agent session after a 429 RateLimitError.
+    rate_limit_max_retries: int = 5
+    # Base delay (seconds) for exponential backoff when no Retry-After header is present.
+    # Delay for attempt N = min(base * 2^N, max_backoff) + jitter(0–1s).
+    rate_limit_base_backoff_seconds: float = 2.0
+    # Hard cap on the computed exponential backoff delay.
+    rate_limit_max_backoff_seconds: float = 120.0
+    # Hard cap on a server-sent Retry-After value we will honour.
+    rate_limit_max_retry_after_seconds: float = 300.0
+
     # ── Anthropic API ─────────────────────────────────────────────────────
     # API key for direct Anthropic API access (the default backend).
     # Falls back to the ANTHROPIC_API_KEY environment variable if empty.

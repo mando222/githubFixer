@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import time
@@ -11,9 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import anthropic
+
 from agents.anthropic_client import AnthropicAPIClient, AnthropicAPIClientOptions
 from agents.codex_client import CodexClient, CodexClientOptions
 from agents.definitions import AGENT_MODELS, CODEX_AGENT_MODELS
+from agents.rate_limit_coordinator import signal_rate_limit, wait_for_api
 from agents.types import AssistantMessage, ResultMessage, RateLimitEvent, TextBlock
 from config import settings
 from linear_client import LinearState, LinearTask, get_linear_client
@@ -60,6 +64,26 @@ def _tool_summary(name: str, inp: dict) -> str:
                 if isinstance(v, str) and v:
                     return v[:80]
             return ""
+
+
+def _extract_retry_after(exc: anthropic.RateLimitError) -> float | None:
+    """Parse a Retry-After delay from a RateLimitError's response headers.
+
+    Checks ``retry-after-ms`` (milliseconds) first, then ``retry-after``
+    (seconds).  Returns None if neither header is present or parseable.
+    Result is capped at settings.rate_limit_max_retry_after_seconds.
+    """
+    try:
+        headers = exc.response.headers  # httpx.Headers on APIStatusError
+        ms = headers.get("retry-after-ms")
+        if ms:
+            return min(float(ms) / 1000.0, settings.rate_limit_max_retry_after_seconds)
+        secs = headers.get("retry-after")
+        if secs:
+            return min(float(secs), settings.rate_limit_max_retry_after_seconds)
+    except Exception:
+        pass
+    return None
 
 
 # Serialize Linear project creation per repo so parallel plan() calls for issues
@@ -149,9 +173,13 @@ def _make_agent_client(
 
 
 async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str, label: str = "") -> str:
-    """Run a single agent session and return the full text response."""
-    collected: list[str] = []
-    tool_call_count = 0
+    """Run a single agent session and return the full text response.
+
+    Retries the full session up to settings.rate_limit_max_retries times when
+    Anthropic returns a 429 RateLimitError.  On each 429 it also signals the
+    global rate-limit coordinator, which pauses all other concurrent agents
+    until the backoff expires (preventing thundering-herd retries).
+    """
     start = time.monotonic()
 
     # Build a numbered per-agent-type logger, e.g. agents.coder3.
@@ -168,52 +196,85 @@ async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str,
         task_summary = task_prompt.strip().replace("\n", " ")[:150]
         alog.info("[%s] START: %s", issue_ref, task_summary)
 
-    try:
-        async with client:
-            await client.query(task_prompt)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in getattr(message, "content", []):
-                        if isinstance(block, TextBlock) and block.text:
-                            if label:
-                                alog.info("[%s] %s", issue_ref, block.text.strip()[:1000])
-                            collected.append(block.text)
-                        elif hasattr(block, "name"):
-                            tool_call_count += 1
-                            if label:
-                                tool_input = getattr(block, "input", {}) or {}
-                                summary = _tool_summary(block.name, tool_input)
-                                if summary:
-                                    alog.info("[%s] TOOL: %s %s", issue_ref, block.name, summary)
-                                else:
-                                    alog.info("[%s] TOOL: %s", issue_ref, block.name)
-                elif isinstance(message, ResultMessage):
-                    is_error = getattr(message, "is_error", False)
-                    if is_error and label:
-                        alog.debug("[%s] TOOL_RESULT: ERROR", issue_ref)
-                elif isinstance(message, RateLimitEvent):
-                    if label:
-                        alog.debug("[%s] RATE_LIMIT event", issue_ref)
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        if label:
-            alog.error(
-                "[%s] FAILED after %.1fs (%d tool calls): %s: %s",
-                issue_ref, elapsed, tool_call_count, type(exc).__name__, exc,
-            )
-        if collected:
+    final_output: list[str] = []
+
+    for attempt in range(settings.rate_limit_max_retries + 1):
+        # Block here (no-op) if another agent already triggered a global pause.
+        await wait_for_api()
+
+        collected: list[str] = []
+        tool_call_count = 0
+
+        try:
+            async with client:
+                await client.query(task_prompt)
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in getattr(message, "content", []):
+                            if isinstance(block, TextBlock) and block.text:
+                                if label:
+                                    alog.info("[%s] %s", issue_ref, block.text.strip()[:1000])
+                                collected.append(block.text)
+                            elif hasattr(block, "name"):
+                                tool_call_count += 1
+                                if label:
+                                    tool_input = getattr(block, "input", {}) or {}
+                                    summary = _tool_summary(block.name, tool_input)
+                                    if summary:
+                                        alog.info("[%s] TOOL: %s %s", issue_ref, block.name, summary)
+                                    else:
+                                        alog.info("[%s] TOOL: %s", issue_ref, block.name)
+                    elif isinstance(message, ResultMessage):
+                        is_error = getattr(message, "is_error", False)
+                        if is_error and label:
+                            alog.debug("[%s] TOOL_RESULT: ERROR", issue_ref)
+                    elif isinstance(message, RateLimitEvent):
+                        if label:
+                            alog.debug("[%s] RATE_LIMIT event", issue_ref)
+
+            # Successful completion — exit the retry loop.
+            final_output = collected
+            break
+
+        except anthropic.RateLimitError as exc:
+            elapsed = time.monotonic() - start
+            delay = _extract_retry_after(exc)
+            if delay is None:
+                delay = min(
+                    settings.rate_limit_base_backoff_seconds * (2 ** attempt),
+                    settings.rate_limit_max_backoff_seconds,
+                ) + random.uniform(0, 1.0)  # jitter prevents synchronized retries
             alog.warning(
-                "[%s] Returning partial output (%d blocks collected before error)",
-                issue_ref, len(collected),
+                "[%s] Rate limited after %.1fs (attempt %d/%d) — pausing %.1fs before retry",
+                issue_ref, elapsed, attempt + 1, settings.rate_limit_max_retries, delay,
             )
-            return "\n".join(collected)
-        raise AgentStreamError(f"Agent {label!r} stream failed: {exc}") from exc
+            await signal_rate_limit(delay)
+            if attempt >= settings.rate_limit_max_retries:
+                raise AgentStreamError(
+                    f"Agent {label!r} hit rate limit {settings.rate_limit_max_retries + 1} times"
+                ) from exc
+            continue
+
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            if label:
+                alog.error(
+                    "[%s] FAILED after %.1fs (%d tool calls): %s: %s",
+                    issue_ref, elapsed, tool_call_count, type(exc).__name__, exc,
+                )
+            if collected:
+                alog.warning(
+                    "[%s] Returning partial output (%d blocks collected before error)",
+                    issue_ref, len(collected),
+                )
+                return "\n".join(collected)
+            raise AgentStreamError(f"Agent {label!r} stream failed: {exc}") from exc
 
     elapsed = time.monotonic() - start
     if label:
         alog.info(
             "[%s] DONE in %.1fs (%d tool calls, %d text blocks)",
-            issue_ref, elapsed, tool_call_count, len(collected),
+            issue_ref, elapsed, tool_call_count, len(final_output),
         )
         # Log token usage if the client exposes it (AnthropicAPIClient sets last_usage)
         usage = getattr(client, "last_usage", None)
@@ -221,7 +282,7 @@ async def _run_agent(client: AnthropicAPIClient | CodexClient, task_prompt: str,
             inp = getattr(usage, "input_tokens", 0)
             out = getattr(usage, "output_tokens", 0)
             alog.info("[%s] TOKENS: %d in / %d out", issue_ref, inp, out)
-    return "\n".join(collected)
+    return "\n".join(final_output)
 
 
 async def _run_ollama_with_fallback(

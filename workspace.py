@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_GH_BIN: str = (
+    shutil.which("gh", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
+    or "gh"
+)
 
 WORKSPACE_ROOT = Path("/tmp/issue-solver")
 BASE_CLONES_ROOT = WORKSPACE_ROOT / "base"
@@ -36,16 +42,36 @@ async def _run(cmd: list[str], cwd: Path | None = None) -> None:
         )
 
 
+async def _is_valid_git_repo(path: Path) -> bool:
+    """Return True if path is a valid git repository."""
+    if not path.exists():
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--git-dir",
+        cwd=str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
+
+
 async def _ensure_base_clone(repo_name: str, full_name: str, base_path: Path) -> None:
     """Clone the repo once, or fetch to refresh an existing base clone."""
-    if base_path.exists():
+    if await _is_valid_git_repo(base_path):
         logger.info("Refreshing base clone for %s", full_name)
         await _run(["git", "fetch", "origin", "--depth", "1"], cwd=base_path)
     else:
+        if base_path.exists():
+            logger.warning(
+                "Base clone for %s exists but is not a valid git repo — removing and re-cloning",
+                full_name,
+            )
+            shutil.rmtree(base_path)
         logger.info("Creating base clone for %s at %s", full_name, base_path)
         base_path.parent.mkdir(parents=True, exist_ok=True)
         await _run(
-            ["gh", "repo", "clone", full_name, str(base_path), "--", "--depth", "1"]
+            [_GH_BIN, "repo", "clone", full_name, str(base_path), "--", "--depth", "1"]
         )
 
 
